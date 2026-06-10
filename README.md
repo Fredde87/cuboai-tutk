@@ -12,6 +12,8 @@ and camera controls (night light, volume, lullabies, detection settings, …).
 > Independent interoperability software for a camera you own. Not affiliated with
 > CuboAI / Cubo or ThroughTek. See `LICENSE`.
 
+![Example output from cuboai_validate.py](screenshot.png)
+
 Validated against a **CuboAI Gen 3** camera (firmware 3.0.1369). Other models / firmware are untested.
 
 ## Feature support
