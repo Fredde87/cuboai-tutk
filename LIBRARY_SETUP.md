@@ -1,4 +1,4 @@
-# Obtaining the TUTK Library
+# Obtaining the TUTK Library (only required for users wanting to use the native library instead of pure python)
 
 ## Why you need this
 
