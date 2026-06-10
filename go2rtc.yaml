@@ -1,0 +1,28 @@
+# go2rtc.yaml — CuboAI combined A/V.
+#
+# The camera exec source emits ONE MPEG-TS with HEVC video + (when CUBOAI_MUX_AUDIO=1,
+# the default) interleaved AAC audio. WebRTC and HLS share no audio codec, so go2rtc
+# transcodes ONLY the audio to Opus for the WebRTC leg via a second ffmpeg source —
+# video stays copy (HEVC passthrough), and HLS/MSE keep the original AAC. No video
+# re-encode anywhere.
+
+streams:
+  cubo:
+    # 1) the camera (pure-Python). killsignal=SIGTERM gives a clean teardown. Audio (AAC)
+    #    is muxed by default; set CUBOAI_MUX_AUDIO=0 in cubo_go2rtc.sh to ship video-only.
+    #    Point this at wherever you installed cubo_go2rtc.sh.
+    - exec:/path/to/cubo_go2rtc.sh#killsignal=SIGTERM
+    # 2) transcode ONLY audio -> Opus for WebRTC; video=copy keeps HEVC passthrough (NOT
+    #    re-encoded). HLS/MSE clients still get the original AAC from source 1; WebRTC
+    #    clients get Opus here.
+    - ffmpeg:cubo#video=copy#audio=opus
+
+# Optional knobs — match your existing install if different.
+api:
+  listen: ":1984"        # http://<host-ip>:1984  (stream page, /api/streams, WebRTC/HLS/MSE links)
+
+# Test URLs (in a browser):
+#   WebRTC : http://<host-ip>:1984/stream.html?src=cubo&mode=webrtc   (expect video + Opus audio)
+#   MSE    : http://<host-ip>:1984/stream.html?src=cubo&mode=mse      (expect video + AAC audio)
+#   HLS    : http://<host-ip>:1984/stream.html?src=cubo&mode=hls      (expect video + AAC audio)
+#   tracks : curl -s http://<host-ip>:1984/api/streams | jq           (expect hevc + aac/opus)
