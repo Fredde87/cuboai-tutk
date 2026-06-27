@@ -49,7 +49,6 @@ import ctypes.util
 import os
 import socket
 import struct
-import subprocess
 import sys
 import threading
 import time
@@ -1312,21 +1311,64 @@ def build_resend_b(R, seq, recv_count, ts=None):
 _TALK_GRANT_CAP_DEFAULT = b"\xe0\xfe\xfe\x01"   # 4.3.x capability word; fallback if connect() didn't capture it
 
 
-def _aac_units(path, rate=16000):
-    """ffmpeg -> a list of AAC-LC ADTS frames (each self-describing; the camera's downlink format)."""
-    adts = subprocess.run(
-        ['ffmpeg', '-y', '-loglevel', 'error', '-i', path, '-ar', str(rate), '-ac', '1',
-         '-c:a', 'aac', '-b:a', '32k', '-f', 'adts', '-'], capture_output=True).stdout
-    out, i = [], 0
+def _aac_units(path, rate=16000, gain=1.0):
+    """Transcode any audio file -> a list of AAC-LC ADTS frames via PyAV (no ffmpeg binary — same
+    dependency as snapshot/record; stays ffmpeg-agnostic). Each frame is self-describing (7-byte
+    ADTS header), which is the camera's downlink format and what the talk uplink mirrors.
+    `gain` is a linear amplitude multiplier (1.0 = unchanged, <1 quieter, >1 louder), applied via
+    libav's `volume` filter — the only reliable talk-volume lever (the camera's speaker_level is
+    firmware-managed)."""
+    import av
+    import io as _io
+    buf = _io.BytesIO()
+    out = av.open(buf, mode='w', format='adts')          # the ADTS muxer writes the AAC-LC headers
+    ostream = out.add_stream('aac', rate=rate)
+    try:
+        ostream.bit_rate = 32000
+    except Exception:
+        pass
+    resampler = av.AudioResampler(format='fltp', layout='mono', rate=rate)  # AAC encoder input fmt
+    graph = None
+    if gain != 1.0:                                       # apply volume via libav's filter (no numpy)
+        graph = av.filter.Graph()
+        _src = graph.add_abuffer(format='fltp', sample_rate=rate, layout='mono')
+        _vol = graph.add('volume', volume=str(gain))
+        _snk = graph.add('abuffersink')
+        _src.link_to(_vol); _vol.link_to(_snk); graph.configure()
+
+    def _encode_frame(fr):
+        for pkt in ostream.encode(fr):
+            out.mux(pkt)
+
+    with av.open(path) as inp:
+        for frame in inp.decode(audio=0):
+            frame.pts = None
+            for rf in resampler.resample(frame):
+                if graph is None:
+                    _encode_frame(rf)
+                else:
+                    graph.push(rf)
+                    while True:
+                        try:
+                            gf = graph.pull()
+                        except (av.error.BlockingIOError, av.error.EOFError):
+                            break
+                        gf.pts = None
+                        _encode_frame(gf)
+        for pkt in ostream.encode(None):                 # flush the encoder
+            out.mux(pkt)
+    out.close()
+    adts = buf.getvalue()
+    units, i = [], 0
     while i + 7 <= len(adts):
         if adts[i] != 0xFF or (adts[i + 1] & 0xF6) != 0xF0:
             break
         flen = ((adts[i + 3] & 0x03) << 11) | (adts[i + 4] << 3) | ((adts[i + 5] >> 5) & 0x07)
         if flen < 7 or i + flen > len(adts):
             break
-        out.append(adts[i:i + flen])           # keep the whole ADTS frame
+        units.append(adts[i:i + flen])                   # keep the whole ADTS frame
         i += flen
-    return out
+    return units
 
 
 def _talk_frameinfo(ts_sec, rate=16000):
@@ -3667,7 +3709,7 @@ class TUTKDirectSession:
 
     # ── two-way audio (talk-to-baby) ──────────────────────────────────────────
     def send_audio_file(self, path, channel=1, loop=False, max_secs=None, rate=16000,
-                        warmup=2.5, on_status=None):
+                        warmup=2.5, on_status=None, gain=1.0):
         """Talk: play an audio file out the camera speaker (pure-Python two-way audio, no native lib).
 
         Talk is the av-connect handshake REVERSED on a separate channel: we open an av-SERVER, the
@@ -3690,13 +3732,15 @@ class TUTKDirectSession:
           rate      AAC sample rate to transcode to (camera expects 16 kHz mono).
           warmup    seconds of live stream before SPEAKERSTART (camera must be in LiveStreamState).
           on_status optional callback(dict) for progress (sent, delivered, decoding, resends).
+          gain      linear volume multiplier (1.0 = unchanged, <1 quieter, >1 louder) — the reliable
+                    talk-volume lever, since the camera's speaker_level is firmware-managed.
         """
         path = os.path.expanduser(path)
         if not os.path.exists(path):
             raise FileNotFoundError(f"Audio file not found: {path}")
-        units = _aac_units(path, rate)
+        units = _aac_units(path, rate, gain)
         if not units:
-            raise RuntimeError(f"no AAC-LC frames produced from {path} (is ffmpeg installed?)")
+            raise RuntimeError(f"no AAC-LC frames produced from {path} (empty or unsupported audio?)")
 
         if self._sock is None or self.session_hdr is None:
             self.disconnect()

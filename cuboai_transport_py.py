@@ -278,15 +278,17 @@ class PureSession:
     def set_environment_alert(self, **kw):        return self._inner.set_environment_alert(**kw)
 
     def send_audio_file(self, path: str, channel: int = 1, loop: bool = False,
-                        max_secs=None, rate: int = 16000, warmup: float = 2.5, on_status=None):
+                        max_secs=None, rate: int = 16000, warmup: float = 2.5, on_status=None,
+                        gain: float = 1.0):
         """Talk: play an audio file out the camera speaker (pure-Python two-way audio, no native lib).
 
         Opens an av-server on a reversed-role talk channel; the camera logs in and pulls AAC-LC audio.
         See cuboai_pure.TUTKDirectSession.send_audio_file for the full flow. `loop`/`max_secs` give a
-        continuous talk stream; `on_status` is an optional progress callback. Returns frames delivered.
+        continuous talk stream; `gain` is a linear volume multiplier (<1 quieter); `on_status` is an
+        optional progress callback. Returns frames delivered.
         """
         return self._inner.send_audio_file(path, channel=channel, loop=loop, max_secs=max_secs,
-                                           rate=rate, warmup=warmup, on_status=on_status)
+                                           rate=rate, warmup=warmup, on_status=on_status, gain=gain)
 
     def stop_audio(self):
         """Ask an in-flight (e.g. looping) send_audio_file to stop at the next tick."""
