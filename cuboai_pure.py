@@ -49,6 +49,7 @@ import ctypes.util
 import os
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -716,33 +717,6 @@ def _clean_gop_video_items(items):
         yield (kind, data, fi)
 
 
-def _file_to_ulaw_8k_mono(path: str) -> bytes:
-    """Decode any audio file -> raw G.711 µ-law, 8 kHz mono (TUTK uplink format).
-
-    Uses PyAV end-to-end (decode + resample + pcm_mulaw encode); avoids the stdlib
-    `audioop` module, which was removed in Python 3.13.
-    """
-    import av
-
-    inp = av.open(path)
-    resampler = av.AudioResampler(format="s16", layout="mono", rate=8000)
-    enc = av.CodecContext.create("pcm_mulaw", "w")
-    enc.format = "s16"
-    enc.layout = "mono"
-    enc.sample_rate = 8000
-    out = bytearray()
-    try:
-        for frame in inp.decode(audio=0):
-            for rf in resampler.resample(frame):
-                for pkt in enc.encode(rf):
-                    out += bytes(pkt)
-        for pkt in enc.encode(None):       # flush
-            out += bytes(pkt)
-    finally:
-        inp.close()
-    return bytes(out)
-
-
 # ── LAN-search probe / ACK (IOTC type 0x601) ──────────────────────────────────
 # These are NOT "xor_frame'd with a random nonce". They are real plaintext run
 # through TransCodePartial (`transcode`), exactly like the av-connect.
@@ -894,6 +868,14 @@ def build_close(R: int, session_fp: bytes = None) -> bytes:
         plain[16:20] = session_fp                  # echo the camera's stored token
     plain += bytes([(R >> 8) & 0xFF ^ 0x28, 0xCE, 0x1D, (R & 0xFF) ^ 0x89])
     return xor_frame(bytes(plain))
+
+
+def _unwrap_index(idx_u16, done_upto):
+    """Lift a u16 wire AV message-index into `done_upto`'s unbounded monotonic space so the
+    reassembly accept-window survives the 65536 wrap (audit H1). Identical to the raw value while
+    no wrap has occurred; across the wrap it continues monotonically (65535 -> 65536). A
+    late/duplicate index maps far forward so the gate still rejects it."""
+    return done_upto + ((idx_u16 - done_upto) & 0xFFFF)
 
 
 def is_keepalive_probe(raw: bytes) -> bool:
@@ -1322,57 +1304,107 @@ def build_resend_b(R, seq, recv_count, ts=None):
     return transcode(bytes(p))
 
 
-def build_audio_data(R, seq, relseq, idx, payload, ts=None):
-    """Build an OUTBOUND (client->camera) audio DATA frame — two-way "talk" audio.
+# ── two-way talk: AAC-LC av-data uplink on a reversed-role talk channel ──────────
+# Talk is the av-connect handshake REVERSED on a separate channel (default ch1): the camera logs
+# into US (we are the av-server) and pulls audio. NB a reliable-IO / G.711-µ-law uplink on ch0
+# ([29]=0x05) is ACKed by the camera but never DECODED — the working uplink is AAC-LC on ch1
+# modelled on the camera's OWN downlink audio av-data frame.
+_TALK_GRANT_CAP_DEFAULT = b"\xe0\xfe\xfe\x01"   # 4.3.x capability word; fallback if connect() didn't capture it
 
-    The audio uplink rides the SAME 0x0407 data channel as IOCTLs but uses a distinct
-    DATA-frame layout (it is NOT an IOCTL — there is no io_type at [64]; the raw G.711
-    µ-law samples start directly at [64], and avlen == len(payload)):
 
-      [6:8]   seq    — packet counter.
-      [28]    0x0c   — DATA sub-type.   [29] 0x05 — audio-DATA marker (IOCTL leaves 0).
-      [32:34] relseq — sender reliable-frame seq (+1 per reliable frame, DATA & ACK).
-      [34:36] 0      — (fresh sends; native reuses it only on a retransmit).
-      [38]    idx    — audio frame index (0,1,2,…).   [39] 0x14 — constant.
-      [40:44] 1      — constant (IOCTL DATA leaves 0).   [44:46] 03 01 — constant.
-      [46:48] idx    — frame index mirror.   [48:52] 01 00 00 01 — constant.
-      [52:54] avlen  — == len(payload) (µ-law byte count; no io_type prefix).
-      [54:56] ts     — 16-bit presentation timestamp (top bit set; camera does NOT
-                       validate it — identical payloads carried different values).
-      [56:58] idx    — frame index mirror.   [60:64] idx+1 (u32).
-      [64:]   payload — raw G.711 µ-law, 8 kHz mono.
-    Reproduces native's audio DATA header byte-for-byte.
-    """
-    pl_len = len(payload)
-    total = 64 + pl_len
-    p = bytearray(total)
-    p[0:4] = b"\x04\x02\x1a\x0a"
-    struct.pack_into("<H", p, 4, total - 16)
-    struct.pack_into("<H", p, 6, seq & 0xFFFF)
-    p[8:12] = b"\x07\x04\x21\x00"
-    struct.pack_into("<H", p, 12, R & 0xFFFF)
-    p[16] = 0x0C
-    struct.pack_into("<H", p, 20, R & 0xFFFF)
+def _aac_units(path, rate=16000):
+    """ffmpeg -> a list of AAC-LC ADTS frames (each self-describing; the camera's downlink format)."""
+    adts = subprocess.run(
+        ['ffmpeg', '-y', '-loglevel', 'error', '-i', path, '-ar', str(rate), '-ac', '1',
+         '-c:a', 'aac', '-b:a', '32k', '-f', 'adts', '-'], capture_output=True).stdout
+    out, i = [], 0
+    while i + 7 <= len(adts):
+        if adts[i] != 0xFF or (adts[i + 1] & 0xF6) != 0xF0:
+            break
+        flen = ((adts[i + 3] & 0x03) << 11) | (adts[i + 4] << 3) | ((adts[i + 5] >> 5) & 0x07)
+        if flen < 7 or i + flen > len(adts):
+            break
+        out.append(adts[i:i + flen])           # keep the whole ADTS frame
+        i += flen
+    return out
+
+
+def _talk_frameinfo(ts_sec, rate=16000):
+    """24-B audio FRAMEINFO trailer mirroring the camera's downlink audio: codec_id 0x0088 @[0:2],
+    sample_rate @[8:10], channels=1 @[10:12], ts_sec @[12:16]. The camera reads its length from the
+    talk-audio frame's [50:52] (==24)."""
+    b = bytearray(24)
+    struct.pack_into('<H', b, 0, 0x0088)
+    struct.pack_into('<H', b, 8, rate)
+    struct.pack_into('<H', b, 10, 1)
+    struct.pack_into('<I', b, 12, ts_sec & 0xFFFFFFFF)
+    return bytes(b)
+
+
+def build_talk_grant(R, channel, seq, login_dec, cap=None):
+    """88-byte talk-channel GRANT (host->cam), modelled on the camera's own 4.3.x av-connect grant.
+    Session R @[12:14]/[20:22]; talk channel @[14]; the capability word @[32:36] is the value the
+    camera advertised in its own grant (passed via `cap`; defaults to the proven 4.3.x constant).
+    The [48:52] token is echoed from the camera's talk-login (per-session)."""
+    Rb = struct.pack('<H', R & 0xFFFF)
+    p = bytearray(88)
+    p[0:4] = b'\x04\x02\x1a\x0a'                  # host->cam
+    struct.pack_into('<H', p, 4, 88 - 16)
+    struct.pack_into('<H', p, 6, seq & 0xFFFF)
+    p[8:12] = b'\x07\x04\x21\x00'
+    p[12:14] = Rb
+    p[14] = channel & 0xFF                         # talk channel
+    p[16:20] = b'\x0c\x00\x00\x00'
+    p[20:22] = Rb
+    p[22:28] = _CLIENT_FINGERPRINT
+    p[28] = 0x00                                   # sub = connect/grant
+    p[29] = 0x21
+    p[30] = 0x0B
+    p[32:36] = cap or _TALK_GRANT_CAP_DEFAULT      # mirror the camera's advertised capability word
+    struct.pack_into('<I', p, 44, 0x24)
+    p[48:52] = (login_dec[48:52] if login_dec and len(login_dec) >= 52 else os.urandom(4))
+    p[56:60] = b'\x00\x01\x00\x01'
+    p[60:64] = b'\x01\x00\x00\x00'
+    p[64:68] = b'\x04\x00\x00\x00'
+    p[68:72] = b'\xfb\x07\x1f\x00'
+    p[80:84] = b'\x63\x06\x13\x10'
+    p[84:88] = b'\x04\x0c\x0c\x63'
+    return transcode(bytes(p))
+
+
+def build_talk_audio(R, channel, seq, relseq, frag, msgidx, au):
+    """Uplink audio AV-DATA frame on the talk channel — modelled on the camera's OWN downlink audio
+    av-data frame so the camera routes it to the audio decoder (the reliable-IO layout build_ioctl_data
+    uses, [45]=0x70/[29]=0x05, delivered but did NOT decode).
+      [14]=channel  [28]=0x0c  [29]=0x01 (audio av-data marker)  [44:46]=0x0103 (av-data type, vs 0x7000
+      IO)  [50:52]=24 (FRAMEINFO trailer len)  avlen@[52:54]  msgidx@[56:58]  [60:64]=msgidx+1.
+    `au` is the AAC-LC ADTS frame followed by the 24-B _talk_frameinfo trailer."""
+    p = bytearray(64 + len(au))
+    p[0:4] = b'\x04\x02\x1a\x0a'
+    struct.pack_into('<H', p, 4, len(p) - 16)
+    struct.pack_into('<H', p, 6, seq & 0xFFFF)
+    p[8:12] = b'\x07\x04\x21\x00'
+    struct.pack_into('<H', p, 12, R & 0xFFFF)
+    p[14] = channel & 0xFF
+    p[16:20] = b'\x0c\x00\x00\x00'
+    struct.pack_into('<H', p, 20, R & 0xFFFF)
     p[22:28] = _CLIENT_FINGERPRINT
     p[28] = 0x0C
-    p[29] = 0x05                                            # audio-DATA marker
+    p[29] = 0x01
     p[30] = 0x0B
-    struct.pack_into("<H", p, 32, relseq & 0xFFFF)
-    p[38] = idx & 0xFF
+    struct.pack_into('<H', p, 32, relseq & 0xFFFF)
+    p[34] = 0x0B
     p[39] = 0x14
     p[40] = 0x01
     p[44] = 0x03
     p[45] = 0x01
-    p[46] = idx & 0xFF
+    struct.pack_into('<H', p, 46, frag & 0xFFFF)
     p[48] = 0x01
-    p[51] = 0x01
-    struct.pack_into("<H", p, 52, pl_len & 0xFFFF)          # avlen == payload length
-    if ts is None:
-        ts = 0x8000 | ((idx * (pl_len or 1)) & 0x7FFF)      # rolling pts (top bit set)
-    struct.pack_into("<H", p, 54, ts & 0xFFFF)
-    p[56] = idx & 0xFF
-    struct.pack_into("<I", p, 60, (idx + 1) & 0xFFFFFFFF)
-    p[64:64 + pl_len] = payload
+    p[50] = 0x18
+    struct.pack_into('<H', p, 52, len(au) & 0xFFFF)
+    struct.pack_into('<H', p, 56, msgidx & 0xFFFF)
+    struct.pack_into('<I', p, 60, (msgidx + 1) & 0xFFFFFFFF)
+    p[64:64 + len(au)] = au
     return transcode(bytes(p))
 
 
@@ -1656,6 +1688,12 @@ class TUTKDirectSession:
         # is waited for (within grace) and emitted instead of skipped+rejected. Matches
         # native (which never gaps). OFF path byte-identical.
         self._nodrop = os.environ.get("CUBOAI_NODROP", "0") != "0"
+        # H1 fix (default ON): the camera AV message-index ([56:58]) is a u16 that WRAPS at
+        # 65536, but `done_upto` is an unbounded monotonic int. _idx_modular lifts each incoming
+        # idx into done_upto's space (modular forward unwrap, _unwrap_index) so the reassembly
+        # accept-window survives the wrap. Byte-identical pre-wrap; OFF reverts to the historical
+        # non-modular gate, which dead-stalls a continuous stream ~every 46 min at the wrap.
+        self._idx_modular = os.environ.get("CUBOAI_IDX_MODULAR", "1") != "0"
         # minimum in-order wait (AU-indices) before advancing past an absent AU — the
         # scaled grace (~4 at LAN) is too short to wait out a >grace-late frag-burst, so
         # the late-but-complete AU is still skipped+rejected; this floor holds each AU long
@@ -1746,6 +1784,11 @@ class TUTKDirectSession:
         self._get_inject = None
         self._inject_lock = threading.Lock()   # M1: one mid-stream GET-inject at a time (no slot clobber)
         self._stat_keepalive_err = 0           # L1: keepalive-reply send failures (surfaces a wedged socket)
+        # Talk (two-way audio): the camera advertises a 4.3.x capability word at [32:36] of its own
+        # av-connect grant; we mirror it into OUR talk grant so the camera accepts us as an av-server.
+        # Captured live in connect(); None until then (falls back to the proven constant if absent).
+        self._cam_grant_cap = None
+        self._talk_stop = False                # cooperative stop flag for a looping send_audio_file / stop_audio()
 
     def _vlog(self, msg):
         """Print a connect/stream trace line when verbose is on (never wire-affecting)."""
@@ -1900,6 +1943,16 @@ class TUTKDirectSession:
                 s, lambda r, dd: len(r) == 88 and dd[0:2] == b"\x20\x41", 0.6)
             if d is not None:
                 self.session_hdr = bytes(d[16:32])
+                # Talk: the same raw grant frame inv_transcodes to the camera's av-connect grant,
+                # whose [32:36] is the 4.3.x capability word our talk grant must mirror. Capture it
+                # here (best-effort) so send_audio_file echoes the camera's OWN value rather than a
+                # hardcoded constant — robust across firmwares. Falls back to the constant if absent.
+                try:
+                    _cap = bytes(inv_transcode(raw)[32:36])
+                    if _cap != b"\x00\x00\x00\x00":
+                        self._cam_grant_cap = _cap
+                except Exception:
+                    pass
                 # Full grant field decode. [29]=0x21 = arming subtype echoed back;
                 # [52]=0 = auth PASS (3 = wrong pw).
                 if self._verbose:
@@ -3113,6 +3166,8 @@ class TUTKDirectSession:
                             gi.done.set()
                         continue
                     idx = struct.unpack("<H", dec[56:58])[0]
+                    if self._idx_modular:                 # H1: lift the u16 index into done_upto's
+                        idx = _unwrap_index(idx, done_upto)  # space so the gate survives the wrap
                     frag = struct.unpack("<H", dec[46:48])[0]
                     avlen = struct.unpack("<H", dec[52:54])[0]
                     chunk = bytes(dec[64:64 + max(0, avlen)])
@@ -3500,6 +3555,30 @@ class TUTKDirectSession:
         return self._cubo_set(cm.build_set_lullaby_schedule(
             volume=volume, duration=duration, get_resp_bytes=data))
 
+    # ── lullaby SCHEDULE-TABLE add/delete (SET_LULLABY_SCHEDULE, 0x0990) ───────
+    # Distinct from set_lullaby_schedule() above (which is the mis-named vol/timer
+    # setter): these write a single alarm-clock schedule ROW. WRITES device state —
+    # UNTESTED on the camera; the CLI gates them behind --i-understand-this-is-unsafe.
+    def add_lullaby_schedule(self, name, *, song=None, uuid=None, days_mask=0x7f,
+                             start_hour=0, start_minute=0, duration_min=None,
+                             duration_sec=None, enable=True, ai=False,
+                             new_name=None, use_local_time=False):
+        """Add (or edit) one lullaby schedule row. The camera keys rows on `name`; to
+        edit/rename pass the existing `name` and a `new_name`. See
+        cuboai_messages.build_set_lullaby_schedule_entry for the full argument map."""
+        import cuboai_messages as cm
+        return self._cubo_set(cm.build_set_lullaby_schedule_entry(
+            name, song=song, uuid=uuid, days_mask=days_mask, start_hour=start_hour,
+            start_minute=start_minute, duration_min=duration_min,
+            duration_sec=duration_sec, enable=enable, ai=ai, new_name=new_name,
+            use_local_time=use_local_time, action=cm.SCHEDULE_ACT_ADD))
+
+    def delete_lullaby_schedule(self, name):
+        """Delete the lullaby schedule row whose `name` matches."""
+        import cuboai_messages as cm
+        return self._cubo_set(cm.build_set_lullaby_schedule_entry(
+            name, action=cm.SCHEDULE_ACT_DELETE))
+
     def set_sleep_safety_setting(self, **kw):
         """Set safe-sleep alert toggles (read-modify-write of SET_SLEEP_SAFETY_SETTING).
         Keywords: safety_alert, cover_alert, sensitivity, baby_presence_alert. Omitted
@@ -3587,58 +3666,164 @@ class TUTKDirectSession:
         return self._cubo_set(cm.build_set_hw_policy(data, **kw))
 
     # ── two-way audio (talk-to-baby) ──────────────────────────────────────────
-    def send_audio_file(self, path, chunk_bytes=576):
-        """Send an audio file to the camera speaker (pure-Python two-way audio).
+    def send_audio_file(self, path, channel=1, loop=False, max_secs=None, rate=16000,
+                        warmup=2.5, on_status=None):
+        """Talk: play an audio file out the camera speaker (pure-Python two-way audio, no native lib).
 
-        Converts the file to the camera's uplink codec — G.711 µ-law, 8 kHz mono —
-        via PyAV, then streams it as outbound audio DATA frames (build_audio_data),
-        paced in real time. The wire frames reproduce the native --talk capture
-        byte-for-byte (see build_audio_data). Returns the number of frames sent.
+        Talk is the av-connect handshake REVERSED on a separate channel: we open an av-SERVER, the
+        camera logs into us and pulls AAC-LC audio. Flow:
+          1. ensure a session, then enter LiveStreamState (talk only runs while a stream is live);
+          2. SPEAKERSTART 0x0350 {channel};
+          3. on the camera's talk-login (sub=0x00 on `channel`) reply with build_talk_grant, mirroring
+             the camera's advertised capability word (self._cam_grant_cap, captured in connect());
+          4. stream the file as AAC-LC ADTS av-data frames (build_talk_audio), paced at the AAC frame
+             duration (~64 ms), honouring the camera's resend (0x09 SACK) requests;
+          5. SPEAKERSTOP 0x0351 and tear the talk channel down.
 
-        `chunk_bytes` µ-law samples per frame (8 kHz → 1 byte/sample); 576 matches
-        native (~72 ms/frame).
+        This method is the SOLE socket sender for its duration (it stops any streaming reader first),
+        mirroring the engine's single-sender rule. Returns the number of audio frames delivered.
+
+        Args:
+          channel   talk channel (default 1; live video is ch0).
+          loop      repeat the file until max_secs (or forever if max_secs is None).
+          max_secs  hard stop after this many seconds (None = until the file/loop ends).
+          rate      AAC sample rate to transcode to (camera expects 16 kHz mono).
+          warmup    seconds of live stream before SPEAKERSTART (camera must be in LiveStreamState).
+          on_status optional callback(dict) for progress (sent, delivered, decoding, resends).
         """
         path = os.path.expanduser(path)
         if not os.path.exists(path):
             raise FileNotFoundError(f"Audio file not found: {path}")
-        ulaw = _file_to_ulaw_8k_mono(path)
+        units = _aac_units(path, rate)
+        if not units:
+            raise RuntimeError(f"no AAC-LC frames produced from {path} (is ffmpeg installed?)")
 
         if self._sock is None or self.session_hdr is None:
             self.disconnect()
             if not self.connect():
                 raise RuntimeError("handshake failed (no 0x2041)")
-
-        # Stream the µ-law as audio DATA frames. The audio frame index is its own
-        # 0-based counter; relseq advances per reliable frame (shared with DATA/ACK).
-        sent = 0
-        for off in range(0, len(ulaw), chunk_bytes):
-            chunk = ulaw[off:off + chunk_bytes]
-            self._sock.sendto(
-                build_audio_data(self._R, self._seq, self._relseq, sent, chunk),
-                self._cam)
-            self._seq += 1
-            self._relseq += 1
-            sent += 1
-            self._drain_acks()
-            time.sleep(len(chunk) / 8000.0)        # real-time pace (8 kHz µ-law)
-        return sent
-
-    def _drain_acks(self):
-        """Non-blocking: consume any pending camera frames and ACK them."""
         import select
-        s = self._sock
-        while True:
-            r, _, _ = select.select([s], [], [], 0)
-            if not r:
-                break
-            try:
-                raw, _ = s.recvfrom(8192)
-            except BlockingIOError:
-                break
-            dec = inv_transcode(raw)
-            if len(dec) >= 68 and dec[28] == 0x0C:
-                self._note_cam_data(dec)
-            self._send_ack()
+        # Be the sole socket sender: a streaming reader thread would race seq/relseq and double-drain.
+        self._stop_reader()
+        s, R, cam = self._sock, self._R, self._cam
+        cap = self._cam_grant_cap            # mirror the camera's own capability word (None -> constant)
+
+        # 1. enter LiveStreamState (the camera only accepts talk while a stream is live).
+        for io, pl in [(0x00FF, b'\x00\x00'),
+                       (0x0300, bytes([0, 0, 0, 0, 4, 0, 1, 0])),
+                       (0x01FF, bytes([0, 0, 0, 0, 4, 0, 1, 0]))]:
+            s.sendto(build_ioctl_data(R, self._seq, self._relseq, self._frmno, io, pl), cam)
+            self._seq += 1; self._relseq += 1; self._frmno += 1
+            time.sleep(0.02)
+
+        spk_sent = grant_sent = False
+        cam_react = 0
+        audio_i = 0                          # index into units[] — WRAPS on loop (the audio content)
+        talk_frag = 0                        # MONOTONIC frag-seq / message-index — never wraps with the
+                                             # content, or the camera rejects looped frames as already-seen
+        talk_relseq = 0
+        delivered = -1                       # camera's AV-DATA D high-water (the decoder path)
+        resends_sent = 0                     # frags re-sent to satisfy the camera's 0x09 SACKs (link health)
+        last_ack = 0.0
+        next_audio = None                    # ABSOLUTE send schedule (anchored at the first frame); a
+                                             # `now`-relative timer drifts ~+8ms/frame -> the camera
+                                             # underruns (measured 72ms vs the 64ms it plays at) -> breakage
+        period = 1024.0 / rate               # AAC frame duration (== 64 ms at 16 kHz): feed at EXACTLY this
+        finished = False
+        sent_buf = {}                        # talk_frag -> au, for resend on the camera's 0x09 SACK
+        t0 = time.time()
+        self._talk_stop = False              # cooperative stop flag (set by stop_audio())
+        try:
+            while not self._talk_stop:
+                now = time.time()
+                if max_secs is not None and now - t0 >= max_secs:
+                    break
+                # Wake precisely when the next audio frame / ACK is due, so pacing stays tight (the loop
+                # also returns early on any camera packet, which we then drain below).
+                waits = [0.1, (last_ack + 0.1) - now]
+                if next_audio is not None:
+                    waits.append(next_audio - now)
+                r, _, _ = select.select([s], [], [], max(0.0, min(waits)))
+                now = time.time()
+                if now - last_ack > 0.1:                         # keep the live stream alive
+                    try: self._send_ack()
+                    except Exception: pass
+                    last_ack = now
+                if not spk_sent and now - t0 > warmup:           # SPEAKERSTART {channel}
+                    pl = struct.pack('<I', channel) + bytes([0, 0, 0, 0])
+                    s.sendto(build_ioctl_data(R, self._seq, self._relseq, self._frmno, 0x0350, pl), cam)
+                    self._seq += 1; self._relseq += 1; self._frmno += 1
+                    spk_sent = True
+                # Pump audio on an ABSOLUTE 64ms grid (advance next_audio by period, never reset to now).
+                if grant_sent and cam_react > 0:
+                    if next_audio is None:
+                        next_audio = now                         # anchor the grid at the first audio frame
+                    while now >= next_audio and not self._talk_stop:
+                        if audio_i >= len(units):
+                            if not loop:
+                                finished = True; break
+                            audio_i = 0                          # loop the file CONTENT (frag keeps climbing)
+                        au = units[audio_i] + _talk_frameinfo(int(now), rate)
+                        s.sendto(build_talk_audio(R, channel, self._seq, talk_relseq, talk_frag, talk_frag, au), cam)
+                        sent_buf[talk_frag] = au
+                        if len(sent_buf) > 128:
+                            sent_buf.pop(min(sent_buf), None)    # bound the resend buffer (~8 s)
+                        self._seq += 1; talk_relseq += 1; talk_frag += 1; audio_i += 1
+                        next_audio += period                     # advance the grid — no cumulative drift
+                        if now - next_audio > 8 * period:        # fell far behind -> resync, don't burst
+                            next_audio = now + period
+                        if on_status and talk_frag % 16 == 0:
+                            on_status(dict(sent=talk_frag, delivered=delivered + 1,
+                                           decoding=delivered >= 0, resends=resends_sent))
+                    if finished:
+                        break
+                if not r:
+                    continue
+                while True:
+                    try: raw, _ = s.recvfrom(8192)
+                    except (BlockingIOError, OSError): break
+                    if len(raw) < 30: continue
+                    try: dec = inv_transcode(raw)
+                    except Exception: continue
+                    if len(dec) < 30: continue
+                    sub = dec[28]; ch = dec[14] if len(dec) > 14 else 0
+                    if sub == 0x0C and len(dec) >= 68 and ch == 0:
+                        self._note_cam_data(dec)                 # advance the live (ch0) C/D
+                    elif sub == 0x00 and ch == channel and len(dec) >= 300:   # camera's talk-login
+                        if not grant_sent:
+                            s.sendto(build_talk_grant(R, channel, self._seq, dec, cap), cam)
+                            self._seq += 1; grant_sent = True
+                    elif ch == channel and grant_sent and sub in (0x09, 0x0A):
+                        cam_react += 1
+                        if sub == 0x09 and len(dec) >= 52:
+                            dD = struct.unpack_from('<H', dec, 38)[0]   # AV-DATA D (decoder high-water)
+                            if dD != 0xFFFF and dD < 0x8000 and dD > delivered:
+                                delivered = dD
+                            # Honour the camera's RESEND-REQUEST: like the host->cam downlink SACK, the
+                            # camera's 0x09 lists MISSING frags as (frag - C) at [50:], count at [42:44],
+                            # C (contiguous base) at [36:38].
+                            cnt = struct.unpack_from('<H', dec, 42)[0]
+                            C = struct.unpack_from('<H', dec, 36)[0]
+                            if 0 < cnt < 256 and C != 0xFFFF:
+                                for k in range(min(cnt, (len(dec) - 50) // 2)):
+                                    frag = (C + struct.unpack_from('<H', dec, 50 + 2 * k)[0]) & 0xFFFF
+                                    au = sent_buf.get(frag)
+                                    if au is not None:
+                                        s.sendto(build_talk_audio(R, channel, self._seq, talk_relseq, frag, frag, au), cam)
+                                        self._seq += 1; talk_relseq += 1; resends_sent += 1
+        finally:
+            if spk_sent:                                          # SPEAKERSTOP {channel}
+                try:
+                    pl = struct.pack('<I', channel) + bytes([0, 0, 0, 0])
+                    s.sendto(build_ioctl_data(R, self._seq, self._relseq, self._frmno, 0x0351, pl), cam)
+                    self._seq += 1; self._relseq += 1; self._frmno += 1
+                except Exception:
+                    pass
+        return talk_frag                     # total audio frames sent (monotonic; spans loops)
+
+    def stop_audio(self):
+        """Ask an in-flight send_audio_file (e.g. a looping talk stream) to stop at the next tick."""
+        self._talk_stop = True
 
     def _stop_reader(self):
         """Stop the background AV reader thread (if streaming) and join it.

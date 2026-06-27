@@ -23,8 +23,10 @@ Backend selection:
     lib_path omitted, none found -> PureSession  (pure Python; the normal case)
 
 The pure backend connects directly over the LAN with no native library and no relay,
-deriving the 16-byte session_hdr, and runs the full AV stack (ioctl, snapshot, and
-video/audio streaming) in pure Python. Only two-way audio (send_audio_file) is a stub.
+deriving the 16-byte session_hdr, and runs the full AV stack (ioctl, snapshot, video/audio
+streaming, and two-way talk via send_audio_file) in pure Python. Two-way talk is PURE-ONLY:
+the native (--lib) backend can't perform the camera's talk handshake, so its send_audio_file
+raises NotImplementedError.
 """
 
 from __future__ import annotations

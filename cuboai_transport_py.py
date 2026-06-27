@@ -261,6 +261,8 @@ class PureSession:
     def set_auto_capture(self, mode):             return self._inner.set_auto_capture(mode)
     def set_lullaby_schedule(self, volume=None, duration=None):
         return self._inner.set_lullaby_schedule(volume=volume, duration=duration)
+    def add_lullaby_schedule(self, name, **kw):   return self._inner.add_lullaby_schedule(name, **kw)
+    def delete_lullaby_schedule(self, name):      return self._inner.delete_lullaby_schedule(name)
     def set_sleep_safety_setting(self, **kw):     return self._inner.set_sleep_safety_setting(**kw)
     # hardware-control SETs (read-modify-write of the 96-byte HW struct)
     def set_hw_control(self, **kw):               return self._inner.set_hw_control(**kw)
@@ -275,9 +277,17 @@ class PureSession:
     def set_danger_zone(self, **kw):              return self._inner.set_danger_zone(**kw)
     def set_environment_alert(self, **kw):        return self._inner.set_environment_alert(**kw)
 
-    def send_audio_file(self, path: str):
-        """Send an audio file to the camera speaker (pure-Python two-way audio).
+    def send_audio_file(self, path: str, channel: int = 1, loop: bool = False,
+                        max_secs=None, rate: int = 16000, warmup: float = 2.5, on_status=None):
+        """Talk: play an audio file out the camera speaker (pure-Python two-way audio, no native lib).
 
-        Returns the number of audio frames sent.
+        Opens an av-server on a reversed-role talk channel; the camera logs in and pulls AAC-LC audio.
+        See cuboai_pure.TUTKDirectSession.send_audio_file for the full flow. `loop`/`max_secs` give a
+        continuous talk stream; `on_status` is an optional progress callback. Returns frames delivered.
         """
-        return self._inner.send_audio_file(path)
+        return self._inner.send_audio_file(path, channel=channel, loop=loop, max_secs=max_secs,
+                                           rate=rate, warmup=warmup, on_status=on_status)
+
+    def stop_audio(self):
+        """Ask an in-flight (e.g. looping) send_audio_file to stop at the next tick."""
+        return self._inner.stop_audio()
