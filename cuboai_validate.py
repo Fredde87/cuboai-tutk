@@ -26,7 +26,8 @@ Capture (playable by default; --raw = unprocessed bitstream):
     --stream-audio           Stream raw AAC-ADTS to stdout
     --duration SECS          Capture duration (default 10)
     --raw                    Unprocessed bitstream (no FRAMEINFO strip / no recovery)
-    --talk FILE              Send audio to the camera speaker (native; pure uplink experimental)
+    --talk FILE              Send audio to the camera speaker (two-way talk; PURE backend only)
+    --talk-loop              Loop --talk continuously   --talk-secs N  stop after N seconds
 
 Control:
     --night-light on|off / --brightness 0-100 / --volume 0-100 / --timer repeat|30min|60min /
@@ -707,7 +708,9 @@ def main():
     parser.add_argument('--record-video', metavar='FILE',              help='Record the raw HEVC video element to file')
     parser.add_argument('--duration',    type=float, default=10.0,    metavar='SECS')
     parser.add_argument('--stream-video', action='store_true',        help='Stream HEVC video to stdout (pipe to ffplay -f hevc -i -)')
-    parser.add_argument('--talk',          metavar='FILE',              help='Send audio file to camera speaker')
+    parser.add_argument('--talk',          metavar='FILE',              help='Send audio file to the camera speaker (two-way talk; pure backend only, not with --lib)')
+    parser.add_argument('--talk-loop',     action='store_true',         help='Loop the --talk file continuously (until --talk-secs or Ctrl-C)')
+    parser.add_argument('--talk-secs',     type=float, metavar='SECS',  help='Stop --talk after SECS (default: once through the file)')
     parser.add_argument('--record-audio',  metavar='FILE',              help='Record AAC audio to file (e.g. audio.aac)')
     parser.add_argument('--record-av',     metavar='BASE',              help='Record both streams: BASE.hevc + BASE.aac')
     parser.add_argument('--stream-audio',  action='store_true',         help='Stream raw AAC-ADTS to stdout')
@@ -764,6 +767,35 @@ def main():
     setg.add_argument('--humi-alert', choices=['on','off'], help='Environment: humidity comfort alert on/off')
     setg.add_argument('--humi-low',   type=int, metavar='PCT', help='Environment: low humidity threshold (pct)')
     setg.add_argument('--humi-high',  type=int, metavar='PCT', help='Environment: high humidity threshold (pct)')
+
+    # ── GATED / UNSAFE writes (require --i-understand-this-is-unsafe) ───────────
+    # The lullaby SCHEDULE-table writer (SET_LULLABY_SCHEDULE 0x0990) is RE'd but
+    # UNTESTED on the live camera — it adds/deletes a schedule row in device state.
+    # Hidden behind the unsafe gate until a live add/read-back/app-confirm passes.
+    gate = parser.add_argument_group("Gated writes (UNSAFE / untested — require --i-understand-this-is-unsafe)")
+    gate.add_argument('--i-understand-this-is-unsafe', dest='unsafe', action='store_true',
+                      help='Acknowledge the gated writes below are untested and modify device state.')
+    gate.add_argument('--add-lullaby-schedule', metavar='SONG',
+                      help='Add a lullaby schedule playing SONG (catalog name or UUID). '
+                           'Use with --schedule-name/--schedule-start/--schedule-duration/'
+                           '--schedule-days/--schedule-ai/--schedule-disable/--schedule-local-time.')
+    gate.add_argument('--delete-lullaby-schedule', metavar='NAME',
+                      help='Delete the lullaby schedule row whose name == NAME.')
+    gate.add_argument('--schedule-name', metavar='NAME',
+                      help='Schedule row name / identity key (default: the song name).')
+    gate.add_argument('--schedule-start', metavar='HH:MM', help='Schedule start time (24h).')
+    gate.add_argument('--schedule-duration', metavar='MIN', type=int,
+                      help='Schedule play length in minutes.')
+    gate.add_argument('--schedule-days', metavar='SPEC', default='all',
+                      help="Day bitmask: 'all' (0x7f = Mon-Sun), or a raw mask "
+                           "(decimal or 0xNN). Per-day bit order is unverified.")
+    gate.add_argument('--schedule-ai', choices=['on', 'off'], default='off',
+                      help='AI auto-play flag for the schedule (default off).')
+    gate.add_argument('--schedule-disable', action='store_true',
+                      help='Create the schedule row in the disabled state (enable=0).')
+    gate.add_argument('--schedule-local-time', action='store_true',
+                      help='Send start time as LOCAL wall-clock (sets the nMDay 0x80 '
+                           'use-local-time bit) instead of verbatim/UTC.')
     parser.add_argument('--list-songs',  action='store_true',         help='List all songs')
     parser.add_argument('--no-status',   action='store_true',         help='Skip the status read (status and AV streaming coexist)')
 
@@ -869,6 +901,12 @@ def main():
     if args.volume is not None and not 0 <= args.volume <= 100:
         parser.error("--volume must be 0-100")
 
+    # ── Gate: the lullaby-schedule writes are untested + modify device state ──
+    if (args.add_lullaby_schedule or args.delete_lullaby_schedule) and not args.unsafe:
+        parser.error("--add-lullaby-schedule / --delete-lullaby-schedule write to the "
+                     "live camera and are UNTESTED — pass --i-understand-this-is-unsafe "
+                     "to proceed.")
+
     # ── Connect ──────────────────────────────────────────────────
     channels = [int(c) for c in args.channels] if args.channels else None   # AV channels (None = all)
     # defer-start: same naming/default as cuboai_stream_video. Default = start fast (_defer=False, so
@@ -917,21 +955,33 @@ def main():
         if args.snapshot:
             take_snapshot(transport, args.snapshot)
 
-        # ── Talk ─────────────────────────────────────────────────
-        if args.talk:
-            print(f"\n🎤 Sending audio to camera: {args.talk}", flush=True)
+        # ── Talk (PURE-PYTHON-ONLY two-way audio: AAC-LC out the camera speaker) ──
+        # The native (--lib) backend cannot perform the camera's talk handshake (the WYZE 4.2.1.1
+        # lib omits the 4.3.x av-server capability word -> avServStartEx times out), so talk is
+        # gated to the pure backend (same discriminator as --benchmark).
+        if args.talk and not hasattr(transport, 'get_stats'):
+            print("\n🎤 Talk is a PURE-PYTHON-only feature — omit --lib / CUBOAI_LIB to use --talk "
+                  "(the native TUTK 4.2.1.1 lib can't do the camera's talk handshake).")
+        elif args.talk:
+            mode = ("looping" if args.talk_loop else "once") + \
+                   (f", {args.talk_secs:g}s" if args.talk_secs else "")
+            print(f"\n🎤 Talk → camera speaker: {args.talk} ({mode})", flush=True)
+            def _talk_status(d):
+                print(f"   …sent {d['sent']} frames, delivered {d['delivered']}, "
+                      f"resends {d.get('resends', 0)}", flush=True)
             try:
-                transport.send_audio_file(args.talk)
-                print("   ✅ Audio sent")
+                n = transport.send_audio_file(args.talk, loop=args.talk_loop,
+                                              max_secs=args.talk_secs, on_status=_talk_status)
+                print(f"   ✅ Talk done ({n} audio frames)")
+            except KeyboardInterrupt:
+                transport.stop_audio()
+                print("   ⏹  Talk stopped")
             except FileNotFoundError as e:
                 print(f"   ❌ {e}")
             except RuntimeError as e:
-                print(f"   ❌ {e}")
+                print(f"   ❌ {e}  (is ffmpeg installed?)")
             except ImportError as e:
-                # Surface the ACTUAL missing module rather than always blaming PyAV
-                # (e.g. the stdlib `audioop` removal in Python 3.13 used to show here).
-                print(f"   ❌ Talkback dependency import failed: {e}  "
-                      f"(transcode needs PyAV: pip install av)")
+                print(f"   ❌ Talk dependency import failed: {e}")
 
         # ── Record video element (raw HEVC) ──────────────────────
         if args.record_video:
@@ -1169,6 +1219,42 @@ def main():
             print(f"\n🔊 Lullaby schedule volume → {args.schedule_volume}...", flush=True)
             try:    transport.set_lullaby_schedule(volume=args.schedule_volume); print("   ✅ Done")
             except Exception as e: print(f"   ❌ Failed: {e}")
+
+        # ── Lullaby schedule TABLE add/delete (gated; SET_LULLABY_SCHEDULE 0x0990) ──
+        if args.delete_lullaby_schedule:
+            print(f"\n🗑  Delete lullaby schedule '{args.delete_lullaby_schedule}'...", flush=True)
+            try:    transport.delete_lullaby_schedule(args.delete_lullaby_schedule); print("   ✅ Sent (UNTESTED — confirm via read-back + app)")
+            except Exception as e: print(f"   ❌ Failed: {e}")
+        if args.add_lullaby_schedule:
+            song = args.add_lullaby_schedule
+            sname = args.schedule_name or song
+            sh, sm = 0, 0
+            if args.schedule_start:
+                try:
+                    hh, mm = args.schedule_start.split(':')
+                    sh, sm = int(hh), int(mm)
+                except Exception:
+                    parser.error("--schedule-start must be HH:MM")
+            dspec = (args.schedule_days or 'all').strip().lower()
+            if dspec in ('all', 'everyday', 'mon-sun', 'daily'):
+                dmask = 0x7f
+            else:
+                try:    dmask = int(dspec, 0) & 0x7f
+                except Exception: parser.error("--schedule-days must be 'all' or a mask (e.g. 0x7f)")
+            print(f"\n🗓  Add lullaby schedule '{sname}' → {song} @ "
+                  f"{sh:02d}:{sm:02d} days=0x{dmask:02x} "
+                  f"dur={args.schedule_duration or 0}min "
+                  f"ai={args.schedule_ai} "
+                  f"{'(local-time)' if args.schedule_local_time else ''}"
+                  f"{' [disabled]' if args.schedule_disable else ''}...", flush=True)
+            try:
+                transport.add_lullaby_schedule(
+                    sname, song=song, days_mask=dmask, start_hour=sh, start_minute=sm,
+                    duration_min=args.schedule_duration, enable=not args.schedule_disable,
+                    ai=(args.schedule_ai == 'on'), use_local_time=args.schedule_local_time)
+                print("   ✅ Sent (UNTESTED — confirm via read-back + app)")
+            except Exception as e:
+                print(f"   ❌ Failed: {e}")
 
         # ── Environment / comfort-range thresholds (read-modify-write) ──
         # --comfort-* are the friendly aliases of --temp-*/--humi-*.
