@@ -28,6 +28,7 @@ Capture (playable by default; --raw = unprocessed bitstream):
     --raw                    Unprocessed bitstream (no FRAMEINFO strip / no recovery)
     --talk FILE              Send audio to the camera speaker (two-way talk; PURE backend only)
     --talk-loop              Loop --talk continuously   --talk-secs N  stop after N seconds
+    --talk-gain MULT         Talk volume multiplier (1.0=unchanged, 0.5=half — speaker_level is firmware-locked)
 
 Control:
     --night-light on|off / --brightness 0-100 / --volume 0-100 / --timer repeat|30min|60min /
@@ -711,6 +712,8 @@ def main():
     parser.add_argument('--talk',          metavar='FILE',              help='Send audio file to the camera speaker (two-way talk; pure backend only, not with --lib)')
     parser.add_argument('--talk-loop',     action='store_true',         help='Loop the --talk file continuously (until --talk-secs or Ctrl-C)')
     parser.add_argument('--talk-secs',     type=float, metavar='SECS',  help='Stop --talk after SECS (default: once through the file)')
+    parser.add_argument('--talk-gain',     type=float, default=1.0, metavar='MULT',
+                        help='Talk volume multiplier (1.0=unchanged, e.g. 0.5 to halve; the camera speaker_level is firmware-locked)')
     parser.add_argument('--record-audio',  metavar='FILE',              help='Record AAC audio to file (e.g. audio.aac)')
     parser.add_argument('--record-av',     metavar='BASE',              help='Record both streams: BASE.hevc + BASE.aac')
     parser.add_argument('--stream-audio',  action='store_true',         help='Stream raw AAC-ADTS to stdout')
@@ -900,6 +903,8 @@ def main():
         parser.error("--brightness must be 0-100")
     if args.volume is not None and not 0 <= args.volume <= 100:
         parser.error("--volume must be 0-100")
+    if args.talk_gain < 0:
+        parser.error("--talk-gain must be >= 0 (1.0 = unchanged, <1 quieter, >1 louder)")
 
     # ── Gate: the lullaby-schedule writes are untested + modify device state ──
     if (args.add_lullaby_schedule or args.delete_lullaby_schedule) and not args.unsafe:
@@ -964,14 +969,16 @@ def main():
                   "(the native TUTK 4.2.1.1 lib can't do the camera's talk handshake).")
         elif args.talk:
             mode = ("looping" if args.talk_loop else "once") + \
-                   (f", {args.talk_secs:g}s" if args.talk_secs else "")
+                   (f", {args.talk_secs:g}s" if args.talk_secs else "") + \
+                   (f", gain {args.talk_gain:g}" if args.talk_gain != 1.0 else "")
             print(f"\n🎤 Talk → camera speaker: {args.talk} ({mode})", flush=True)
             def _talk_status(d):
                 print(f"   …sent {d['sent']} frames, delivered {d['delivered']}, "
                       f"resends {d.get('resends', 0)}", flush=True)
             try:
                 n = transport.send_audio_file(args.talk, loop=args.talk_loop,
-                                              max_secs=args.talk_secs, on_status=_talk_status)
+                                              max_secs=args.talk_secs, on_status=_talk_status,
+                                              gain=args.talk_gain)
                 print(f"   ✅ Talk done ({n} audio frames)")
             except KeyboardInterrupt:
                 transport.stop_audio()
@@ -979,9 +986,9 @@ def main():
             except FileNotFoundError as e:
                 print(f"   ❌ {e}")
             except RuntimeError as e:
-                print(f"   ❌ {e}  (is ffmpeg installed?)")
+                print(f"   ❌ {e}")
             except ImportError as e:
-                print(f"   ❌ Talk dependency import failed: {e}")
+                print(f"   ❌ Talk needs PyAV for transcoding: {e}  (pip install av)")
 
         # ── Record video element (raw HEVC) ──────────────────────
         if args.record_video:

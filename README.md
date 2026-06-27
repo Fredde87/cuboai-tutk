@@ -36,7 +36,7 @@ Validated against a **CuboAI Gen 3** camera (firmware 3.0.1369). Other models / 
 | HEVC (H.265) video + AAC audio (16 kHz mono), combined MPEG-TS | ✅ |
 | Loss recovery (selective-repeat) + clean-GOP gating | ✅ |
 | go2rtc streaming (video passthrough, audio → Opus) | ✅ |
-| Two-way talk (send audio to the camera) | ⚠️ Implemented (AAC-LC), **untested** by ear |
+| Two-way talk (send audio to the camera) | ✅ Working — AAC-LC, paced + loss-recovered (**pure backend only**) |
 | Detection zones | 🔬 Complex struct, not implemented |
 | Accessory / config SETs (sleep-mat, smart-temp, light RGB) | ⚠️ Implemented behind `--i-understand-this-is-unsafe`, **untested** |
 
@@ -58,9 +58,9 @@ Validated against a **CuboAI Gen 3** camera (firmware 3.0.1369). Other models / 
   works on 3.13+ where the stdlib `audioop` module was removed (none of the media
   paths use `audioop` — PyAV handles all transcoding).
 - **[PyAV](https://pypi.org/project/av/)** (`pip install av`) — required for `--snapshot`
-  (JPEG), `--record` (MP4), and `--talk` (two-way audio: it transcodes the file to
-  **AAC-LC**, the camera's uplink codec). Plain streaming does not need it. (`--talk` is built
-  but UNTESTED — not yet confirmed audible.)
+  (JPEG), `--record` (MP4), and `--talk` (it transcodes the audio file to **AAC-LC 16 kHz
+  mono**, the camera's uplink codec). PyAV bundles its own ffmpeg libraries, so no separate
+  ffmpeg binary is needed. Plain streaming does not need PyAV.
 
 ### Getting your camera credentials
 
@@ -136,8 +136,8 @@ Set `CUBOAI_MUX_AUDIO=0` to ship video-only. Verbose output can also be enabled 
 and exercises its features: JPEG snapshots, synced MP4/HEVC/AAC recording, a full camera **status
 card** (sensors, Wi-Fi incl. RSSI, lighting, detection settings, lullaby schedule, session stats,
 connected users), camera **controls** (night light, volume, lullabies, detection sensitivity, …), a
-**Wi-Fi placement benchmark**, and experimental two-way **talk**. Credentials are passed the same way
-as the streamer.
+**Wi-Fi placement benchmark**, and two-way **talk** (`--talk`, pure backend only). Credentials are
+passed the same way as the streamer.
 
 ```bash
 # Save a JPEG snapshot (needs PyAV)
@@ -161,12 +161,17 @@ Capture commands: `--snapshot`, `--record`, `--record-video`, `--record-audio`,
 Control commands: `--night-light`, `--brightness`, `--volume`, `--timer`, `--play`,
 `--stop`, `--list-songs`, `--sleep-mode`, and many more under `--help`.
 
-> **Two-way audio (`--talk`) — IMPLEMENTED BUT UNTESTED.** The talk-to-camera path is wired on
-> both backends (it transcodes the file to the camera's uplink codec via PyAV and streams it on
-> the AV channel). It has been verified to transmit and be accepted by the camera on the wire, but
-> has **not yet been confirmed audible from the camera speaker** — treat it as experimental. The
-> camera's two-way-audio handshake (SPEAKERSTART + an AAC-LC uplink during an active live stream)
-> is reverse-engineered but unconfirmed end-to-end.
+> **Two-way audio (`--talk`) — WORKING (pure Python, no native lib).** `--talk FILE` plays an
+> audio file out the camera speaker; `--talk-loop` (+ optional `--talk-secs N`) streams it
+> continuously. It is the av-connect handshake *reversed* on a separate channel: the client opens
+> an AV server, the camera logs in and pulls **AAC-LC 16 kHz mono** audio (SPEAKERSTART → grant →
+> AAC av-data, during an active live stream). Audio is paced on the exact 64 ms AAC frame grid and
+> lost frames are recovered via the camera's selective-repeat (SACK) requests — verified audible
+> end-to-end, smooth, and resilient to ~15% induced uplink loss. Transcoding uses PyAV (`pip install av`).
+> Use **`--talk-gain MULT`** to set the volume (a linear multiplier — `0.5` = half, `2.0` = double;
+> default `1.0`), which is the reliable lever since the camera's speaker level is firmware-managed.
+> **Talk is pure-backend only** — the native `--lib` TUTK 4.2.1.1 library omits the 4.3.x av-server
+> capability the camera's talk handshake needs, so `--talk` is rejected in `--lib` mode.
 
 ### Wi-Fi placement & performance benchmark
 
