@@ -1849,6 +1849,17 @@ class TUTKDirectSession:
         MID-independent) rather than the legacy 64K xor-table heuristic, so the
         one-time `_build_R_table()` is not built here.
         """
+        # camera_ip is REQUIRED: the pure backend sends a unicast LAN-search probe to
+        # the camera's IP — there is no broadcast auto-discovery (a blank IP is NOT a
+        # "discover" mode; see cuboai_validate._validate_startup, which rejects it the
+        # same way). Fail fast here with a clear message so a missing/None IP can never
+        # reach the `::ffff:` formatter / probe sendto below as a raw TypeError.
+        if not self.camera_ip:
+            raise ValueError(
+                "camera_ip is required to connect: the pure backend sends a unicast "
+                "LAN-search probe to the camera's IP — there is no broadcast "
+                "auto-discovery. Obtain the camera's LAN IP from the Cubo account/REST "
+                "API and pass it, e.g. TUTKDirectSession(camera_ip='192.0.2.10').")
 
         deadline = time.time() + timeout
 
