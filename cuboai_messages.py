@@ -1984,3 +1984,284 @@ def parse_set_result(raw: bytes) -> dict:
     (+ reserved). result==0 means the camera accepted the change."""
     return {'id': _u32(raw, 0), 'result': _i32(raw, 4),
             'ok': _i32(raw, 4) == 0, 'raw_len': len(raw), 'raw_hex': raw[:16].hex()}
+
+
+# ===========================================================================
+# SET_LULLABY_SCHEDULE — add / edit / delete ONE schedule-table row
+# ---------------------------------------------------------------------------
+# Reverse-engineered from the decompiled APK smali (app v2.23.2):
+#   * CameraCommandFactory.setLullabyScheduleCmd → io_type **0x0990 (2448)**;
+#     resp 0x0991 (2449), standard {id@0, result@4} (parse_set_result).
+#   * SMsgAVIoctrlSetLullabyScheduleReq.toBytes:  id@0(LE32) · action@4(LE32) ·
+#     schedule[getFullSize]@8.   action: SCHEDULE_ACT_ADD=0, SCHEDULE_ACT_DELETE=1.
+#   * SMsgLullabySchedule.toBytes (CREATOR.getFullSize()=140) — the camera-bound
+#     entry blob:
+#         @0   enable        (LE int32)
+#         @4   name          (UTF-8, 40 NUL-padded)   MAX_NAME_SIZE=0x28
+#         @44  newName       (UTF-8, 40 NUL-padded)   <- NOT in the GET response
+#         @84  uuid          (UTF-8, 44 NUL-padded)   MAX_UUID_SIZE=0x2c
+#         @128 nMDay         (byte; low 7 bits = day bitmask, 0x80 = use-local-time)
+#         @129 nStartHour    (byte)
+#         @130 nStartMinute  (byte)
+#         @131 nAi           (byte; AI auto-play 0/1)
+#         @132 duration      (LE int32, SECONDS)
+#         @136 [4 bytes ZERO — the `create` slot; toBytes computes
+#               leIntToByteArray(create) but DISCARDS it, so `created` is never sent]
+#     Total SET payload = 8 + 140 = **148 bytes**.
+#
+# This is NOT a whole-list write and NOT a byte mirror of the GET response. The GET
+# stride-100 entry (parse_lullaby_schedules) is {enable,name(40),uuid(44),day,hour,
+# min,ai,duration,created} with NO newName and WITH created. The SET inserts a 40-byte
+# newName after name (shifting uuid 44→84, the day/time/ai/duration block +40) and
+# zeroes the trailing created slot. So a SET row reproducing a GET row is a field-level
+# transform, not a copy — see the round-trip self-test below.
+#
+# Semantics (LullabyViewModel.addLullabySchedule / deleteLullabySchedule +
+# LullabyScheduleSettingFragment): the camera keys rows on `name`.
+#   * ADD, create : name = the display name, newName = ''  → inserts a new row.
+#   * ADD, edit   : name = the EXISTING name (identity key), newName = the new name.
+#   * DELETE      : a fresh entry with ONLY name set (enable defaults 1) → removes the
+#                   row whose name matches; all other fields are ignored.
+#
+# NOTE on naming: build_set_lullaby_schedule / set_lullaby_schedule are ALREADY taken
+# by the (mis-named) lullaby VOLUME/timer setter (SET_LULLABY_VOL_DURATION, 2438). The
+# schedule-TABLE writer therefore uses the *_entry suffix to avoid a collision.
+#
+# UNTESTED ON THE CAMERA as of the RE date — it WRITES device state. The offline
+# round-trip below proves the encode is field-faithful; the live add/read-back/app
+# confirm is gated behind --i-understand-this-is-unsafe and an explicit go-ahead.
+# ===========================================================================
+
+IOTYPE_USER_SET_LULLABY_SCHEDULE_REQ  = 0x0990   # 2448
+IOTYPE_USER_SET_LULLABY_SCHEDULE_RESP = 0x0991   # 2449
+
+SCHEDULE_ACT_ADD    = 0   # create OR edit (camera keys the row on `name`)
+SCHEDULE_ACT_DELETE = 1   # delete the row whose `name` matches
+
+_LSCHED_NAME_SIZE = 0x28  # MAX_NAME_SIZE = 40
+_LSCHED_UUID_SIZE = 0x2c  # MAX_UUID_SIZE = 44
+_LSCHED_ENTRY_SIZE = _LSCHED_NAME_SIZE * 2 + _LSCHED_UUID_SIZE + 16  # getFullSize() = 140
+_LSCHED_DAY_LOCALTIME = 0x80  # nMDay bit7 = "use local time" (isUseLocalTime)
+
+
+def _resolve_song_uuid(song) -> str:
+    """Resolve a lullaby `song` (display name OR raw UUID) to its catalog UUID.
+    Empty/None → '' (used by DELETE, which needs no song)."""
+    if not song:
+        return ''
+    s = str(song).strip()
+    # already a UUID? (the catalog keys are 36-char dashed UUIDs)
+    if '-' in s and len(s) >= 32:
+        return s
+    low = s.lower()
+    for u, (_key, disp, _cat) in LULLABY_CATALOG.items():
+        if disp.lower() == low:
+            return u
+    raise ValueError(f"unknown lullaby '{song}' — pass a catalog name (see --list-songs) "
+                     f"or a full UUID")
+
+
+def _encode_lullaby_schedule_entry(*, enable=1, name='', new_name='', uuid='',
+                                   days_mask=0, start_hour=0, start_minute=0,
+                                   ai=0, duration_sec=0) -> bytes:
+    """Encode the 140-byte SMsgLullabySchedule.toBytes() blob (camera-bound).
+    See the module banner above for the field map. Strings are UTF-8, byte-capped to
+    MAX_NAME/MAX_UUID (matches the APK, which also char-trims via setName). The 4-byte
+    `create` slot at @136 is left zero, exactly as the APK toBytes leaves it."""
+    buf = bytearray(_LSCHED_ENTRY_SIZE)
+    struct.pack_into('<i', buf, 0, int(enable))
+    nb = name.encode('utf-8')[:_LSCHED_NAME_SIZE]
+    buf[4:4 + len(nb)] = nb
+    xb = (new_name or '').encode('utf-8')[:_LSCHED_NAME_SIZE]
+    buf[44:44 + len(xb)] = xb
+    ub = uuid.encode('utf-8')[:_LSCHED_UUID_SIZE]
+    buf[84:84 + len(ub)] = ub
+    buf[128] = int(days_mask) & 0xff
+    buf[129] = int(start_hour) & 0xff
+    buf[130] = int(start_minute) & 0xff
+    buf[131] = (1 if ai else 0)
+    struct.pack_into('<i', buf, 132, int(duration_sec))
+    return bytes(buf)
+
+
+def build_set_lullaby_schedule_entry(name, *, song=None, uuid=None,
+                                     days_mask=0x7f, start_hour=0, start_minute=0,
+                                     duration_min=None, duration_sec=None,
+                                     enable=True, ai=False, new_name=None,
+                                     use_local_time=False,
+                                     action=SCHEDULE_ACT_ADD,
+                                     correlation_id=0) -> tuple[int, bytes]:
+    """SET_LULLABY_SCHEDULE_REQ (0x0990) — add / edit / delete ONE schedule row.
+
+    Builds the 148-byte payload described in the module banner above. The camera keys
+    rows on `name`.
+
+    Args:
+        name:           the schedule row name (REQUIRED — the identity key). For a
+                        create this is also the display name; for an edit it is the
+                        EXISTING name and `new_name` carries the new display name.
+        song / uuid:    the lullaby to play — a catalog display name OR a UUID (`song`
+                        is resolved via LULLABY_CATALOG; `uuid` is taken verbatim).
+                        Ignored for DELETE.
+        days_mask:      day bitmask, low 7 bits = Mon..Sun (0x7f = every day). The per-
+                        day bit order is unverified, so prefer 0x7f or a raw mask.
+        start_hour/min: schedule start time. If use_local_time, these are LOCAL wall-
+                        clock and bit 0x80 is OR'd into the day byte (the app's modern
+                        path); otherwise they are written verbatim (caller owns any
+                        UTC conversion). Ignored for DELETE.
+        duration_min / duration_sec: play length; minutes OR seconds (seconds wins if
+                        both given). Ignored for DELETE.
+        enable:         1 = active schedule, 0 = stored-but-disabled. Ignored for DELETE
+                        (the APK delete path sends the constructor default enable=1).
+        ai:             AI auto-play flag. Ignored for DELETE.
+        new_name:       only for an ADD/edit rename; '' for a plain create.
+        action:         SCHEDULE_ACT_ADD (0) or SCHEDULE_ACT_DELETE (1).
+        correlation_id: echoed back in the response id (the app uses a truncated
+                        currentTimeMillis(); any value works — the camera echoes it).
+
+    Returns (io_type, payload_bytes).
+    """
+    if not name:
+        raise ValueError("a schedule `name` is required (the camera keys rows on name)")
+
+    if action == SCHEDULE_ACT_DELETE:
+        # The APK delete path constructs a fresh SMsgLullabySchedule (enable defaults
+        # to 1) and sets ONLY the name — every other field is left at its default.
+        entry = _encode_lullaby_schedule_entry(enable=1, name=name)
+    else:
+        resolved_uuid = uuid if uuid else _resolve_song_uuid(song)
+        if duration_sec is not None:
+            dur = int(duration_sec)
+        elif duration_min is not None:
+            dur = int(duration_min) * 60
+        else:
+            dur = 0
+        day = (int(days_mask) & 0x7f)
+        if use_local_time:
+            day |= _LSCHED_DAY_LOCALTIME
+        entry = _encode_lullaby_schedule_entry(
+            enable=1 if enable else 0, name=name, new_name=(new_name or ''),
+            uuid=resolved_uuid, days_mask=day, start_hour=start_hour,
+            start_minute=start_minute, ai=ai, duration_sec=dur)
+
+    payload = bytearray(8 + len(entry))
+    # id is the low 32 bits of the app's (int)currentTimeMillis() — pack unsigned and
+    # mask so any value (incl. a full ms clock) yields the same 4 wire bytes the app sends.
+    struct.pack_into('<I', payload, 0, int(correlation_id) & 0xFFFFFFFF)
+    struct.pack_into('<i', payload, 4, int(action))
+    payload[8:] = entry
+    return IOTYPE_USER_SET_LULLABY_SCHEDULE_REQ, bytes(payload)
+
+
+def parse_set_lullaby_schedule_entry(payload: bytes) -> dict:
+    """Decode a SET_LULLABY_SCHEDULE_REQ payload built by
+    build_set_lullaby_schedule_entry (the symmetric inverse — used by the offline
+    round-trip self-test, and handy for inspecting an outbound command)."""
+    if len(payload) < 8 + _LSCHED_ENTRY_SIZE:
+        raise ValueError(f"SET schedule payload too short: {len(payload)}")
+    e = payload[8:]
+    def _s(a, b):
+        return e[a:b].split(b'\x00', 1)[0].decode('utf-8', 'replace')
+    return {
+        'id':           _u32(payload, 0),
+        'action':       _i32(payload, 4),
+        'enable':       _i32(e, 0),
+        'name':         _s(4, 44),
+        'new_name':     _s(44, 84),
+        'uuid':         _s(84, 128),
+        'days_mask':    e[128],
+        'start_hour':   e[129],
+        'start_minute': e[130],
+        'ai':           e[131],
+        'duration_sec': _u32(e, 132),
+    }
+
+
+def _encode_get_lullaby_schedule_entry(*, enable=1, name='', uuid='', days_mask=0,
+                                       start_hour=0, start_minute=0, ai=0,
+                                       duration_sec=0, created=0) -> bytes:
+    """Encode one 100-byte GET-response (stride-100) entry — the inverse of the per-
+    entry decode in parse_lullaby_schedules. Test/round-trip helper only (the camera
+    is the real producer of these bytes)."""
+    buf = bytearray(100)
+    struct.pack_into('<i', buf, 0, int(enable))
+    nb = name.encode('utf-8')[:_LSCHED_NAME_SIZE]
+    buf[4:4 + len(nb)] = nb
+    ub = uuid.encode('utf-8')[:_LSCHED_UUID_SIZE]
+    buf[44:44 + len(ub)] = ub
+    buf[88] = int(days_mask) & 0xff
+    buf[89] = int(start_hour) & 0xff
+    buf[90] = int(start_minute) & 0xff
+    buf[91] = (1 if ai else 0)
+    struct.pack_into('<i', buf, 92, int(duration_sec))
+    struct.pack_into('<i', buf, 96, int(created))
+    return bytes(buf)
+
+
+def _selftest_lullaby_schedule_roundtrip():
+    """Offline round-trip proof: take the live 'brown noise' schedule fields, encode a
+    realistic GET-response, decode it with parse_lullaby_schedules, build a SET ADD from
+    the decoded fields, decode the SET, and assert every schedule field survives the
+    GET→SET layout transform (and that the shared byte ranges are byte-identical)."""
+    # Live-captured 'brown noise' row (WORKORDER: Brown Noise @ 18:00 Mon–Sun, 14h01m).
+    fields = dict(enable=1, name='brown noise',
+                  uuid='DED63F0F-7129-4570-AFA5-C01BD163BC72',
+                  days_mask=0x7f, start_hour=18, start_minute=0, ai=0,
+                  duration_sec=14 * 3600 + 1 * 60)          # 50460 s = 14h01m
+    get_entry = _encode_get_lullaby_schedule_entry(created=1700000000, **fields)
+    get_resp = struct.pack('<ii', 0, 0) + get_entry + b'\x00' * (1008 - 8 - len(get_entry))
+    decoded = parse_lullaby_schedules(get_resp)
+    assert decoded['schedules'], "GET decode produced no schedules"
+    g = decoded['schedules'][0]
+    assert g['name'] == 'brown noise' and g['days_mask'] == 0x7f
+    assert g['start_hour'] == 18 and g['duration_sec'] == 50460
+
+    io_type, payload = build_set_lullaby_schedule_entry(
+        g['name'], uuid=g['uuid'], days_mask=g['days_mask'],
+        start_hour=g['start_hour'], start_minute=g['start_minute'],
+        duration_sec=g['duration_sec'], enable=bool(g['enable']),
+        ai=g['ai_autoplay'], action=SCHEDULE_ACT_ADD)
+    assert io_type == IOTYPE_USER_SET_LULLABY_SCHEDULE_REQ
+    assert len(payload) == 148, f"SET payload size {len(payload)} != 148"
+    s = parse_set_lullaby_schedule_entry(payload)
+
+    # Every schedule field survives the GET(100)→SET(140) layout transform.
+    for sk, gk in (('enable', 'enable'), ('name', 'name'), ('uuid', 'uuid'),
+                   ('days_mask', 'days_mask'), ('start_hour', 'start_hour'),
+                   ('start_minute', 'start_minute'), ('ai', 'ai_autoplay'),
+                   ('duration_sec', 'duration_sec')):
+        assert s[sk] == g[gk], f"round-trip mismatch on {sk}: {s[sk]!r} != {g[gk]!r}"
+    assert s['new_name'] == '' and s['action'] == SCHEDULE_ACT_ADD
+
+    # Byte-level: the shared ranges between the 100-byte GET entry and the 140-byte SET
+    # entry are identical — enable+name (@0:44 both), uuid (GET @44:88 == SET @84:128),
+    # duration (GET @92:96 == SET @132:136); the day/time/ai bytes match value-for-value.
+    set_entry = payload[8:]
+    assert set_entry[0:44] == get_entry[0:44], "enable+name bytes differ"
+    assert set_entry[84:128] == get_entry[44:88], "uuid bytes differ"
+    assert set_entry[132:136] == get_entry[92:96], "duration bytes differ"
+    assert (set_entry[128], set_entry[129], set_entry[130], set_entry[131]) == \
+           (get_entry[88], get_entry[89], get_entry[90], get_entry[91]), "day/time/ai differ"
+
+    # DELETE path: fresh entry, name only, enable defaults 1 (matches the APK).
+    _, dpayload = build_set_lullaby_schedule_entry('brown noise',
+                                                   action=SCHEDULE_ACT_DELETE)
+    d = parse_set_lullaby_schedule_entry(dpayload)
+    assert d['action'] == SCHEDULE_ACT_DELETE and d['name'] == 'brown noise'
+    assert d['enable'] == 1 and d['uuid'] == '' and d['duration_sec'] == 0
+
+    # use_local_time sets the 0x80 day bit and keeps the low-7 mask.
+    _, lpayload = build_set_lullaby_schedule_entry(
+        'lt', song='White Noise', days_mask=0x7f, start_hour=9, duration_min=30,
+        use_local_time=True)
+    lt = parse_set_lullaby_schedule_entry(lpayload)
+    assert lt['days_mask'] == 0xff and lt['duration_sec'] == 1800
+    assert lt['uuid'] == 'F55001F0-9D5A-4C09-B58C-896964CAE485'  # White Noise
+    print("Lullaby-schedule SET round-trip OK "
+          "(io 0x0990, 148B, GET→SET field-faithful, DELETE + local-time paths)")
+
+
+if __name__ == '__main__':
+    # Runs after every definition above (the legacy self-test block sits earlier in
+    # the file, before these functions exist, so the schedule round-trip lives here).
+    _selftest_lullaby_schedule_roundtrip()
