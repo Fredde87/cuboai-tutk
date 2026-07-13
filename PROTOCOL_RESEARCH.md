@@ -47,10 +47,15 @@ off-LAN/WAN access — a region/account-specific `*.iotcplatform.com` host on po
 
 LAN frames are **not encrypted**. They are the real plaintext run through TUTK's
 `TransCodePartial` — a fixed-key block scramble (per-16-byte-block ror/xor/shuffle; the
-trailing `len % 16` bytes are a plain XOR with the key). The key is the classic TUTK
-easter-egg string. This is fully reversed: `cuboai_pure.transcode()` /
-`inv_transcode()`. Decode **any** frame with `inv_transcode(raw)`; do **not** re-apply the
-`Swap` permutation to the tail.
+trailing `len % 16` bytes are XOR'd with the key, and for tail lengths **2/4/8** a `Swap`
+byte-permutation is applied on top: `wire_tail = Swap(plain_tail XOR key)`). The key is
+the classic TUTK easter-egg string. This is fully reversed and byte-identical to the
+native `TransCodePartial` (encode) and `ReverseTransCodePartial` (decode) for every
+length: `cuboai_pure.transcode()` / `inv_transcode()`. Decode a post-connect
+data-channel frame (IOCTL / video / audio) with `inv_transcode(raw)`. (The tail Swap
+applies to those data-channel frames only; the pre-session search probe/ack and the
+keepalive/close frames are sent without it — `transcode(..., swap_tail=False)` and
+`xor_frame` build those.)
 
 ### LAN discovery
 
@@ -271,10 +276,24 @@ treat as experimental.
 - **Sleep / privacy mode** (`0x092A` get / `0x092C`... see table): a **96-byte** payload —
   `[0:4]` Unix timestamp LE, `[4:88]` zeros, `[88]` on/off flag (1/0), `[89:96]` zeros. (The
   initial "12-byte, flag @4" guess was silently accepted but did nothing.)
-- **Lullaby schedule** (`get_lullaby_schedules`): entries at **stride 100 from offset 8** —
-  `enable@+0`, `name@+4` (40 B), `uuid@+44` (44 B), `days_mask@+88` (bitmask, `0x7f` =
-  Mon–Sun), `start_hour@+89`, `start_minute@+90`, `ai_autoplay@+91`, `duration@+92` (LE32
-  **seconds**), `created@+96`. The `uuid` maps to a song via the app's lullaby catalog.
+- **Lullaby schedule — read** (`get_lullaby_schedules`, io `0x098E`/resp `0x098F`): entries at
+  **stride 100 from offset 8** — `enable@+0`, `name@+4` (40 B), `uuid@+44` (44 B),
+  `days_mask@+88` (bitmask, `0x7f` = Mon–Sun), `start_hour@+89`, `start_minute@+90`,
+  `ai_autoplay@+91`, `duration@+92` (LE32 **seconds**), `created@+96`. The `uuid` maps to a
+  song via the app's lullaby catalog.
+- **Lullaby schedule — write** (`SET_LULLABY_SCHEDULE`, io **`0x0990`**/resp `0x0991`,
+  `build_set_lullaby_schedule_entry`): adds/edits/deletes **one** row (not the whole list) and
+  is **NOT** a byte mirror of the read. The 148-byte payload is `id@0` (LE32, echoed) ·
+  `action@4` (LE32: **0=ADD/edit, 1=DELETE**) · a **140-byte** entry blob @8. The entry differs
+  from the read: it inserts a 40-byte `newName@+44` after `name`, so `uuid` moves to `+84`,
+  `nMDay@+128`, `start_hour@+129`, `start_minute@+130`, `nAi@+131`, `duration@+132` (LE32
+  seconds), and the trailing 4-byte `created` slot (`+136`) is **left zero** (the APK `toBytes`
+  computes it but discards it). The camera **keys rows on `name`**: ADD-create uses
+  `name`=display name with `newName`=`""`; ADD-edit uses `name`=existing name + `newName`=new
+  name; DELETE sends a fresh entry with only `name` set (`enable` defaults 1). `nMDay` bit
+  `0x80` = "use local time" (start time is local wall-clock); the low 7 bits are the day mask.
+  RE'd from the APK smali; offline round-trip vs the read is field-faithful, but the **live
+  write is still UNTESTED** — the CLI gates it behind `--i-understand-this-is-unsafe`.
 - **Standard response prefix**: every `SMsg*Resp` begins `{id@0, result@4, …}` — a `result`
   word (0 on success) sits at offset 4 of most GET responses.
 - **Wi-Fi** (`get_wifi`): SSID/IP/MAC plus, for the connected AP, **RSSI (dBm) @0xa0**,
@@ -310,6 +329,7 @@ empty payload. The CLI hides the untested/destructive SETs behind
 | 0x0984 | 0x0985 | GET_LULLABY_VOL_DURATION | confirmed |
 | 0x0986 | 0x0987 | SET_LULLABY_VOL_DURATION | confirmed |
 | 0x0988 | 0x0989 | GET_LULLABY_SCHEDULES | read (decoded) |
+| 0x0990 | 0x0991 | SET_LULLABY_SCHEDULE (add/edit/delete one row) | RE'd, gated (untested live) |
 | 0x0994 | 0x0995 | GET_COUGH_SETTING / SET | read / gated |
 | 0x099A | 0x099B | GET_CONNECTED_USER | read |
 | 0x1100 | 0x1101 | GET_NIGHT_LIGHT_ON_OFF / SET | confirmed |
