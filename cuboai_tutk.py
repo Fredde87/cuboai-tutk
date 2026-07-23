@@ -61,9 +61,8 @@ Despite the codec_id field in the frame info struct reading 0x0088, the
 actual format is ADTS-AAC. The codec_id interpretation is incorrect for
 this camera (it doesn't map to standard TUTK codec constants).
 
-This native backend is optional: it is used only if you supply your own TUTK
-library via lib_path (or CUBOAI_LIB). The pure-Python backend is the default and
-needs no library. The shared library is not distributed with this project.
+Confirmed working: CuboAI firmware 3.0.1369, app v2.23.2, lib 4.2.1.1-H.
+See LIBRARY_SETUP.md for how to obtain the library.
 """
 import ctypes
 import io

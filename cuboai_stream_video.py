@@ -11,8 +11,9 @@ plays in MSE/HLS/WebRTC. `--raw` reverts to the original byte-for-byte HEVC Anne
 (the byte-identical regression anchor). `--output-format annexb` keeps Annex-B but still strips
 the trailer. Audio (AAC) is available, gated behind CUBOAI_MUX_AUDIO (default off).
 
-The pure-Python transport runs a background reader that keeps the camera's send-window open even
-if go2rtc's pipe back-pressures, so the stream does not stall.
+STATUS: Working at ~10–12 fps. The pure-Python transport's background reader keeps the camera's
+send-window open even if go2rtc's pipe back-pressures, so the stream does not stall (session-14
+C/D windowed-ACK fix).
 
 Usage in go2rtc config (go2rtc.yaml):
     streams:
@@ -45,7 +46,8 @@ Known limitations:
       CUBOAI_MUX_AUDIO=1; go2rtc transcodes it to Opus for the WebRTC leg.
 
 See also:
-    cuboai_stream_audio.py — standalone audio stream
+    cuboai_stream_audio.py — standalone audio stream (legacy)
+    LIBRARY_SETUP.md       — native library notes (the deployment runs pure Python)
 """
 
 import argparse
@@ -126,7 +128,7 @@ def _verbose_loop(sess, interval, camera_stats, stop):
 
     Runs on a daemon thread reading the engine's read-only get_stats() snapshot (lock-free,
     no socket I/O) and pairing successive snapshots through cuboai_pure.stats_delta for the
-    interval fps/bitrate/loss/recovery — the same metric set the benchmark prints.
+    interval fps/bitrate/loss/recovery — the same Task-1 metric set the benchmark prints.
     With camera_stats it also folds the camera 0x0934 session-stats at a slower cadence
     (injected on the reader thread via get_during_stream, so it never races the AV socket).
     Decoupled from the engine's own verbose (_vlog prints to stdout) so media stays clean.
@@ -356,8 +358,8 @@ def main() -> None:
     # the 00 00 00 01 start codes.
     import time as _time
     stdout = sys.stdout.buffer
-    # Optional per-video-AU emit-timestamp trace (latency/jitter harness). Gated; when
-    # CUBOAI_EMIT_TS_FILE is unset this is a no-op and the stream is byte-identical.
+    # Optional per-video-AU emit-timestamp trace (overnight #2 latency/jitter harness). Gated;
+    # when CUBOAI_EMIT_TS_FILE is unset this is a no-op and the stream is byte-identical.
     _etsf = None
     _ets = os.environ.get('CUBOAI_EMIT_TS_FILE')
     if _ets:
@@ -371,9 +373,10 @@ def main() -> None:
 
     try:
         if output_format == 'mpegts':
-            # MPEG-TS path: carry per-AU PTS from the camera FRAMEINFO so MSE/HLS play along
-            # currentTime without underrun (the PTS, not arrival timing, drives the timeline).
-            # clean-GOP (default on) drops incomplete AUs until the next clean keyframe.
+            # MPEG-TS path (Part C): carry per-frame PTS from the camera FRAMEINFO so MSE/HLS play
+            # along currentTime without underrun. PACE is not used here — the PTS, not arrival
+            # timing, drives the timeline. The muxing loop lives in mux_timed_stream() (shared with
+            # the validator). clean-GOP (default on) drops incomplete AUs until the next clean IDR.
             clean_gop = os.environ.get('CUBOAI_CLEAN_GOP', '1') != '0'
             mux_audio = os.environ.get('CUBOAI_MUX_AUDIO', '0') != '0'
             mux_timed_stream(sess.av_frames_timed(), _emit, clean_gop=clean_gop, mux_audio=mux_audio)

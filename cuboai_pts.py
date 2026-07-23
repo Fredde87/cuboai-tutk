@@ -144,17 +144,20 @@ class AudioTimeline:
 
     def timestamp_ms(self, ts_sec, sample_rate=None):
         """Absolute ms for an audio AU whose FRAMEINFO carries ts_sec (and optionally sample_rate)."""
-        # ┌─ DO NOT "FIX" THE ±56 ms SUB-INDEX OSCILLATION — it is correct by design. ───────────────┐
-        # │ `_sub * frame_ms` re-quantises 15.625 frame/s AAC-16k audio onto the 1 s ts_sec grid, so │
-        # │ the audio PTS LEADS its true sample time by 0..56 ms (mean −27.5 ms). This is BOUNDED    │
-        # │ and EXACTLY 8 s-PERIODIC (125-frame cycle) — NOT accumulating drift, NOT a constant      │
-        # │ offset; it returns to 0 every cycle and never grows on a 24/7 stream. It is the          │
-        # │ INTENTIONAL price of the per-second re-anchor below: the re-anchor turns a lost AU into  │
-        # │ a self-correcting ≤1 s gap instead of the cumulative A/V drift a free-running            │
-        # │ `anchor + k·64 ms` counter would accrue. The camera's sub-second ts is GARBAGE, so       │
-        # │ ±56 ms is the FLOOR without 1 s of look-ahead. It is sub-perceptual (mean < the ~45 ms   │
-        # │ ITU-R BT.1359 audio-ahead threshold; go2rtc AAC→Opus + the WebRTC jitter buffer re-time  │
-        # │ it away). "Cap _sub < 1000 ms" / "space frames evenly" REINTRODUCES drift. Leave it.     │
+        # ┌─ DO NOT "FIX" THE ±56 ms SUB-INDEX OSCILLATION — it is correct by design (audit L4, ────┐
+        # │ verified 2026-06-10; numbers in wo_bug_audit.md / wo_l4_diagnose.py).                   │
+        # │ `_sub * frame_ms` re-quantises 15.625 frame/s AAC-16k audio onto the 1 s ts_sec grid,   │
+        # │ so the audio PTS LEADS its true sample time by 0..56 ms (mean −27.5 ms). This is        │
+        # │ BOUNDED and EXACTLY 8 s-PERIODIC (125-frame cycle: error[k]==error[k+125]) — it is NOT  │
+        # │ accumulating drift and NOT a constant offset; it returns to 0 every cycle and never     │
+        # │ grows on a 24/7 stream. It is the INTENTIONAL price of the per-second re-anchor below:  │
+        # │ the re-anchor turns a lost AU into a self-correcting ≤1 s gap instead of the cumulative │
+        # │ A/V drift a free-running `anchor + k·64 ms` counter would accrue. The camera's          │
+        # │ sub-second ts field is GARBAGE, so ±56 ms is the FLOOR achievable without 1 s of        │
+        # │ look-ahead buffering. It is sub-perceptual (mean < the ~45 ms ITU-R BT.1359 audio-ahead │
+        # │ threshold; go2rtc AAC→Opus + the WebRTC jitter buffer re-time it away) and audio is     │
+        # │ confirmed fine in use. "Cap _sub < 1000 ms" / "space frames evenly" REINTRODUCES drift  │
+        # │ AND changes the validated replay SHAs for a non-problem. Leave it alone.                │
         # └─────────────────────────────────────────────────────────────────────────────────────────┘
         if sample_rate:
             self._frame_ms = 1000.0 * self._spf / float(sample_rate)
