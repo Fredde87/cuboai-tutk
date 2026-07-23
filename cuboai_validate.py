@@ -35,7 +35,7 @@ Control:
     --timer repeat|30min|60min /
     --play NAME / --stop / --sleep-mode on|off / --list-songs.  See --help for the full SET
     command group (night-vision, cry/cough detection, sleep-safety, comfort range, …).
-    --no-status              Skip the status read (status and AV streaming coexist)
+    --no-status              Skip the status read (status + AV coexist since session 24)
 
 Environment: CUBOAI_LIB, CUBOAI_UID, CUBOAI_ACCOUNT, CUBOAI_PASSWORD, CUBOAI_CAMERA_IP
 """
@@ -283,6 +283,10 @@ def _render_status(d: dict) -> str:
         _row(sec, "Sleep alerts", ss.get('mode_desc'))
     if baby is not None:
         _row(sec, "Baby presence", _onoff(baby))
+    sslive = d.get('get_sleep_safety') or {}          # LIVE status (0x…GET_SLEEP_SAFETY_STATUS)
+    if sslive.get('status') is not None:
+        rt = sslive.get('remaining_time')
+        _row(sec, "Safety (live)", f"status={sslive.get('status')}" + (f"  {rt}s left" if rt else ""))
     if sec:
         L.append("\n  😴 Sleep & Safety"); L += sec
 
@@ -412,9 +416,309 @@ def _render_status(d: dict) -> str:
     return "\n".join(L)
 
 
-def print_status(sess) -> None:
-    """Read every GET method and print the clean CuboAI status card."""
+# ── Detection history (s_log) — LOCAL per-minute history, NOT a live reading ──────
+# The s_log fields are a per-minute detection/presence history (bp/na/mo/bw/be/pr + te/hu),
+# retrieved by pulling the on-camera DVR manifest over RDT (cuboai_playback). Value semantics are
+# CONFIRMED against the decompiled app (TimelinePageAdapter.getMediaFilePaint/ViewHolder): bp 1=present
+# in-view / 2=absent (bidirectional, pinned to the minute); na=noise level 0..100 (>=60 elevated);
+# mo 2=motion active; bw 1=well-being active; be 1|2=baby-event; pr 1=sleep/privacy (else recording).
+# The app's "Caregiver Present" state is NOT here — it rides a separate Region-events feed we don't
+# pull (see cuboai_playback._EVENT_KEYS note). Freshness ~1 min when the growing hour serves (settled
+# 2026-07-17); older when a pull fails. CORRECTNESS: this is HISTORY — every value carries its reading
+# time + age and the section is labelled history; a failed pull just makes the age grow (never live).
+_HIST_BP = {1: "in crib", 2: "not in crib"}   # footage-confirmed 2026-07-23
+_SPARK = "▁▂▃▄▅▆▇█"
+
+
+def _sparkline(vals):
+    """Unicode block sparkline for a numeric series; None entries render as a gap (space)."""
+    nums = [v for v in vals if v is not None]
+    if not nums:
+        return ""
+    lo, hi = min(nums), max(nums)
+    span = (hi - lo) or 1.0
+    out = []
+    for v in vals:
+        if v is None:
+            out.append(" ")
+        else:
+            out.append(_SPARK[int((v - lo) / span * (len(_SPARK) - 1) + 0.5)])
+    return "".join(out)
+
+
+def pull_history_sensors(transport, hours_back=3, timeout=10):
+    """Freshest retrievable s_log record. Try the GROWING hour first (1a: it serves, ~1 min
+    lag), then fall back through completed hours if a pull fails (deterministic never_started
+    is still possible). Returns (latest MinuteRecord, hour_utc) or (None, None). Never raises."""
+    import cuboai_playback as pb, datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    # retries=0: the flake is a camera conn_id wedge that RAPID retry only prolongs; a starve is best
+    # left to the caller's NEXT poll cycle (minutes later = a released conn_id), not hammered now.
+    for h in range(hours_back):
+        dt = now - _dt.timedelta(hours=h)
+        try:
+            recs, _ = pb.pull_manifest(transport, dt, timeout=timeout, retries=0)
+        except Exception:
+            recs = None
+        if recs:
+            return recs[-1], dt
+    return None, None
+
+
+def _render_history(rec, now_utc):
+    """Render the s_log HISTORY section — clearly separated from the live sensors above."""
+    import datetime as _dt
+    head = "\n  🕒 Detection History (s_log — LOCAL history, NOT a live reading)"
+    if rec is None:
+        return [head, "    (no manifest retrievable this pull — history unavailable; "
+                      "last-good ages until the next successful pull)"]
+    age = max(int(now_utc.timestamp()) - int(rec.ts), 0)
+    am, asec = divmod(age, 60)
+    age_str = f"{am} min {asec:02d}s ago" if am else f"{asec}s ago"
+    loc = _dt.datetime.fromtimestamp(int(rec.ts)).astimezone()
+    utc = _dt.datetime.fromtimestamp(int(rec.ts), _dt.timezone.utc)
+    tzhint = "" if loc.utcoffset() else "  (host TZ=UTC; camera locale ≈UTC+1 — set $TZ for true local)"
+    f = rec.flags or {}
+    L = [head, f"    as of {loc:%H:%M} local / {utc:%H:%M} UTC  —  {age_str}{tzhint}"]
+    # Field meanings CONFIRMED against live footage (2026-07-23, fredde rewatched real recordings):
+    #   bp = baby in the crib (1=in crib/visible, 2=not in crib)   na = noise level (per-minute avg)
+    #   nm = noise PEAK (caught a loud noise the avg softened)      mo = motion (0 still / 1 moving; the
+    #   app's "strong" 2 never occurred in 72h)                     ni = NIGHT-VISION / IR (1=IR/dark, 0=day)
+    #   pr = sleep/privacy (0=recording). NOTE ni & nm are real firmware sensors the APP itself never
+    #   reads (decompile: no app consumer) — surfacing them here is beyond what the official app shows.
+    #   bw = firmware ACTIVITY bit (disasm: app's ONLY use is getMediaFilePaint, where bw==1 is 1 of 4
+    #   OR-inputs that tint the tick "active"; no name/threshold/other consumer; exact trigger firmware-
+    #   internal + noisy — crying+rolling was bw=2). bw==0 (rare) ~ out-of-crib w/ carer. se=record counter,
+    #   ve=format version, be=baby-event flag (never fired in 72h here) — structural, shown raw.
+    #   NOT in s_log at all (CLOUD sleep-analysis): cough, cry, caregiver, movement, face-covered, rollover.
+    bp = f.get("bp")
+    if bp is not None:
+        L.append(f"    {'Baby in crib:':<{_W}} {_HIST_BP.get(bp, 'unknown')} (bp={bp})")
+    ni = f.get("ni")
+    if ni is not None:
+        L.append(f"    {'Night vision:':<{_W}} {'on (IR / dark)' if ni == 1 else 'off (daylight)'} (ni={ni})")
+    na = f.get("na")
+    if na is not None:
+        L.append(f"    {'Noise avg:':<{_W}} {na}{'  (≥60 = elevated)' if na >= 60 else ''}")
+    nm = f.get("nm")
+    if nm is not None:
+        L.append(f"    {'Noise peak:':<{_W}} {nm}")
+    mo = f.get("mo")
+    if mo is not None:
+        mlbl = {0: 'still', 1: 'moving'}.get(mo, f'strong ({mo})')
+        L.append(f"    {'Motion:':<{_W}} {mlbl} (mo={mo})")
+    bw = f.get("bw")
+    if bw is not None:
+        # DISASM-definitive: the app's ONLY use of bw is getMediaFilePaint (TimelinePageAdapter:643) —
+        # its sole consumer besides Room plumbing (3 total field accesses). There, bw==1 is one of four
+        # OR-inputs (be∈{1,2} OR bw==1 OR mo==2 OR na>=60) that tint the minute-tick "active" vs "calm".
+        # No name/@ColumnInfo/threshold/analytics/other consumer → bw is an OPAQUE firmware ACTIVITY bit
+        # the app just forwards into a colour. Its exact firmware trigger is unknown + noisy (footage:
+        # fires on some activity, not all — crying+rolling was bw=2). bw==0 (rare) ~ out-of-crib w/ carer.
+        desc = 'out of crib (caregiver?)' if bw == 0 else ('flagged active' if bw == 1 else 'not flagged')
+        L.append(f"    {'Activity (bw):':<{_W}} {desc} (bw={bw})  [firmware bit; app only uses it to tint the tick]")
+    pr = f.get("pr")
+    if pr is not None:
+        L.append(f"    {'Sleep/privacy:':<{_W}} {'sleep mode' if pr == 1 else 'recording'} (pr={pr})")
+    if rec.temp is not None:
+        L.append(f"    {'Temp (hist):':<{_W}} {rec.temp}°C")
+    if rec.humidity is not None:
+        L.append(f"    {'Humidity (hist):':<{_W}} {rec.humidity}%")
+    # identified but not a live sensor: be=baby-event flag (unfired in 72h here), se=per-minute record
+    # counter, ve=format version. Shown raw for completeness.
+    extra = [(k, f.get(k)) for k in ("be", "se", "ve") if f.get(k) is not None]
+    if extra:
+        L.append(f"    {'(raw be/se/ve):':<{_W}} " + " ".join(f"{k}={v}" for k, v in extra)
+                 + "  (event-flag / record counter / version)")
+    return L
+
+
+def pull_history_window(transport, hours_back=1, timeout=10):
+    """Retrieve the FULL per-minute s_log window across up to `hours_back` hours, merged + sorted
+    (minute-deduped). ONE manifest pull already carries a whole hour's minutes, so hours_back=1 is a
+    single pull (the growing hour). Older hours are paced (native ~0.5s parity) to avoid the conn_id
+    wedge. Returns list[MinuteRecord] (possibly empty); never raises."""
+    import cuboai_playback as pb, datetime as _dt, time as _t
+    now = _dt.datetime.now(_dt.timezone.utc)
+    merged = {}
+    for h in range(max(int(hours_back), 1)):
+        if h:
+            _t.sleep(0.5)                       # pace older-hour pulls (conn_id release parity)
+        dt = now - _dt.timedelta(hours=h)
+        try:
+            recs, _ = pb.pull_manifest(transport, dt, timeout=timeout, retries=0)
+        except Exception:
+            recs = None
+        for r in (recs or []):
+            merged[int(r.ts) - (int(r.ts) % 60)] = r
+    return [merged[k] for k in sorted(merged)]
+
+
+def dump_history_raw_keys(transport, hours_back=1, timeout=10):
+    """Diagnostic (read-only, standalone): pull the manifest(s) and report the RAW s_log key inventory
+    THIS firmware actually emits vs what parse_manifest models — settles whether ni/nm/se/ve (or any
+    other key) are present in OUR pulls, distinct from 'unconfirmed meaning'. Never raises."""
+    import cuboai_playback as pb, datetime as _dt, time as _t
+    now = _dt.datetime.now(_dt.timezone.utc)
+    reports = []
+    for h in range(max(int(hours_back), 1)):
+        if h:
+            _t.sleep(0.5)
+        diag = {}
+        try:
+            pb.pull_manifest(transport, now - _dt.timedelta(hours=h), timeout=timeout,
+                             retries=0, diag=diag)
+        except Exception:
+            pass
+        raw = diag.get("raw_json")
+        if raw:
+            reports.append(pb.raw_manifest_keys(raw))
+    print("\n  🔎 Manifest RAW-key inventory (what the firmware emits vs what we model)")
+    if not reports:
+        print("    (no manifest retrievable this pull — nothing to inspect; try when no stream is active)")
+        return
+    top, rec, unmapped, ranges, nrec = set(), set(), set(), {}, 0
+    for r in reports:
+        top |= set(r["top_level"]); rec |= set(r["record_keys"]); unmapped |= set(r["unmapped"])
+        nrec += r["n_records"]
+        for k, (lo, hi, n) in r["numeric_ranges"].items():
+            a, b, c = ranges.get(k, (lo, hi, 0)); ranges[k] = (min(a, lo), max(b, hi), c + n)
+    modelled = set(pb._EVENT_KEYS) | {"ts", "te", "hu"}
+    print(f"    hours pulled: {len(reports)}   s_log records: {nrec}")
+    print(f"    top-level keys : {sorted(top)}")
+    print(f"    record keys    : {sorted(rec)}")
+    print(f"    modelled       : {sorted(rec & modelled)}")
+    print(f"    UNMAPPED keys  : {sorted(unmapped) if unmapped else '(none — we model every emitted key)'}")
+    for k in sorted(unmapped):
+        lo_hi = ranges.get(k)
+        print(f"      {k}: range {lo_hi[0]}..{lo_hi[1]} over {lo_hi[2]} recs" if lo_hi else f"      {k}: (non-numeric)")
+    for k in ("ni", "nm", "se", "ve"):
+        print(f"    {k}: {'PRESENT' if k in rec else 'ABSENT'} in this firmware's manifests")
+
+
+def _history_series(records):
+    """The numeric s_log series worth charting → [(label, unit, [values-aligned-to-records])]."""
+    return [
+        ("Temp",       "°C", [r.temp for r in records]),
+        ("Humidity",   "%",  [r.humidity for r in records]),
+        ("Noise avg",  "",   [(r.flags or {}).get("na") for r in records]),
+        ("Noise peak", "",   [(r.flags or {}).get("nm") for r in records]),
+    ]
+
+
+def _render_history_charts(records, now_utc):
+    """Terminal ASCII sparkline per numeric s_log series over the retrieved window, with a LOCAL-time
+    axis (UTC alongside). HISTORY — the header carries the window's start/end time + reading count so
+    staleness stays visible; a chart never implies a live reading."""
+    import datetime as _dt
+    if len(records) < 2:
+        return []
+    ts = [int(r.ts) for r in records]
+    t0 = _dt.datetime.fromtimestamp(ts[0]).astimezone()
+    t1 = _dt.datetime.fromtimestamp(ts[-1]).astimezone()
+    u0 = _dt.datetime.fromtimestamp(ts[0], _dt.timezone.utc)
+    u1 = _dt.datetime.fromtimestamp(ts[-1], _dt.timezone.utc)
+    span_min = (ts[-1] - ts[0]) // 60 + 1
+    end_age = max(int(now_utc.timestamp()) - ts[-1], 0)
+    L = ["\n  📈 History charts (s_log window — LOCAL history, NOT a live reading)",
+         f"    window {t0:%Y-%m-%d %H:%M}→{t1:%H:%M} local  ({u0:%H:%M}→{u1:%H:%M} UTC)  ·  "
+         f"{len(records)} readings / ~{span_min} min  ·  newest {end_age//60}m{end_age%60:02d}s ago"]
+    any_series = False
+    for name, unit, vals in _history_series(records):
+        nums = [v for v in vals if v is not None]
+        if not nums:
+            continue
+        any_series = True
+        lo, hi, last = min(nums), max(nums), nums[-1]
+        L.append(f"    {name:<9} {_sparkline(vals)}  "
+                 f"{lo:g}–{hi:g}{unit} (last {last:g}{unit})")
+    if not any_series:
+        return []
+    width = len(records)
+    al, ar = f"{t0:%H:%M}", f"{t1:%H:%M}"
+    pad = max(width - len(al) - len(ar), 1)
+    L.append(f"    {'':<9} {al}{' ' * pad}{ar}  (local)")
+    return L
+
+
+def _write_history_html(records, path, now_utc):
+    """Write a self-contained (no external deps/CDN) HTML chart of the s_log window — inline SVG line
+    charts per numeric series, LOCAL-time x-axis. Richer view of the same data as the ASCII charts."""
+    import datetime as _dt, html
+    ts = [int(r.ts) for r in records]
+    t0 = _dt.datetime.fromtimestamp(ts[0]).astimezone()
+    t1 = _dt.datetime.fromtimestamp(ts[-1]).astimezone()
+    W, H, PADX, PADY = 720, 140, 48, 18
+    def svg(vals, unit, color):
+        pts = [(i, v) for i, v in enumerate(vals) if v is not None]
+        if len(pts) < 2:
+            return "<p style='opacity:.6'>(not enough data)</p>"
+        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+        xlo, xhi = 0, max(len(vals) - 1, 1)
+        ylo, yhi = min(ys), max(ys); yspan = (yhi - ylo) or 1.0
+        def X(i): return PADX + (i - xlo) / (xhi - xlo or 1) * (W - 2 * PADX)
+        def Y(v): return H - PADY - (v - ylo) / yspan * (H - 2 * PADY)
+        poly = " ".join(f"{X(i):.1f},{Y(v):.1f}" for i, v in pts)
+        grid = (f"<line x1='{PADX}' y1='{H-PADY}' x2='{W-PADX}' y2='{H-PADY}' class='ax'/>"
+                f"<text x='{PADX-6}' y='{Y(yhi):.1f}' class='yl'>{yhi:g}{unit}</text>"
+                f"<text x='{PADX-6}' y='{Y(ylo):.1f}' class='yl'>{ylo:g}{unit}</text>"
+                f"<text x='{PADX}' y='{H-4}' class='xl' style='text-anchor:start'>{t0:%H:%M}</text>"
+                f"<text x='{W-PADX}' y='{H-4}' class='xl' style='text-anchor:end'>{t1:%H:%M}</text>")
+        return (f"<svg viewBox='0 0 {W} {H}' width='100%' preserveAspectRatio='xMidYMid meet'>"
+                f"{grid}<polyline points='{poly}' fill='none' stroke='{color}' "
+                f"stroke-width='2' stroke-linejoin='round'/></svg>")
+    end_age = max(int(now_utc.timestamp()) - ts[-1], 0)
+    blocks = []
+    for (name, unit, vals), color in zip(_history_series(records),
+                                         ("#e06c3b", "#3b82e0", "#8a3be0", "#3ba06c")):
+        if not any(v is not None for v in vals):
+            continue
+        blocks.append(f"<section><h2>{html.escape(name)}</h2>{svg(vals, unit, color)}</section>")
+    doc = f"""<!doctype html><html lang="en"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CuboAI s_log history</title>
+<style>
+ :root{{color-scheme:light dark}}
+ body{{font:14px/1.5 system-ui,sans-serif;margin:1.5rem;max-width:820px}}
+ h1{{font-size:1.15rem;margin:.2rem 0}} h2{{font-size:.95rem;margin:.8rem 0 .2rem}}
+ .meta{{opacity:.7;font-size:.85rem;margin-bottom:1rem}}
+ section{{border:1px solid #8884;border-radius:8px;padding:.6rem .8rem;margin:.7rem 0}}
+ .ax{{stroke:#8886;stroke-width:1}} .yl{{fill:#888;font-size:10px;text-anchor:end;dominant-baseline:middle}}
+ .xl{{fill:#888;font-size:10px}}
+</style>
+<h1>CuboAI detection history (s_log)</h1>
+<p class="meta">LOCAL history — NOT a live reading. Window {t0:%Y-%m-%d %H:%M}→{t1:%H:%M} local
+ ({len(records)} readings). Newest reading {end_age//60}m{end_age%60:02d}s before this file was written.</p>
+{''.join(blocks) or '<p>(no numeric series in this window)</p>'}
+</html>"""
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(doc)
+
+
+def print_status(sess, history=False, history_hours=1, history_chart=None) -> None:
+    """Read every GET method and print the clean CuboAI status card. When `history` (opt-in),
+    append the s_log HISTORY section + charts — an extra RDT manifest pull (~1 min lag). OPT-IN because
+    the RDT pull does NOT coexist with a live stream (Phase-3 live test: its pull fails and the
+    feed is disturbed); only run it when no stream is active."""
+    import datetime as _dt
     print(_render_status(_read_all(sess)))
+    if history:
+        now_utc = _dt.datetime.now(_dt.timezone.utc)
+        records = pull_history_window(sess, hours_back=history_hours)
+        if records:
+            rec = records[-1]
+        else:
+            rec, _hr = pull_history_sensors(sess)   # fallback through older hours for a latest reading
+        print("\n".join(_render_history(rec, now_utc)))
+        if len(records) >= 2:
+            print("\n".join(_render_history_charts(records, now_utc)))
+        if history_chart and records:
+            path = os.path.expanduser(history_chart)
+            try:
+                _write_history_html(records, path, now_utc)
+                print(f"    📈 wrote chart: {path}  ({len(records)} readings)")
+            except Exception as e:
+                print(f"    ⚠ chart write failed: {e}")
 
 
 def take_snapshot(sess, path: str) -> None:
@@ -608,7 +912,7 @@ def run_benchmark(transport, interval=2.0, cap=None, csv_path=None):
 def _clamp_env_knobs():
     """Range-clamp the numeric CUBOAI_* tuning env vars (startup only, stderr only) so a zero/absurd
     override can't divide-by-zero or break recovery. Non-numeric -> default; out-of-range -> clamp."""
-    KNOBS = [
+    KNOBS = [  # (env, lo, hi, default-or-None, is_float)
         ('CUBOAI_GAP_DEPTH_CAP', 1, 10000, 200, False),
         ('CUBOAI_RECOVERY_HOLD', 0, 2000, 24, False),
         ('CUBOAI_LONE_SKIP_ROUNDS', 0, 2000, 20, False),
@@ -642,7 +946,7 @@ def _validate_startup(args, uid, account, password, camera_ip):
     if not camera_ip:
         errs.append("--camera-ip (or CUBOAI_CAMERA_IP) is required — the pure backend connects "
                     "directly to the camera (no LAN broadcast discovery). The IP comes from the REST API.")
-    elif _re.fullmatch(r'[\d.]+', camera_ip):
+    elif _re.fullmatch(r'[\d.]+', camera_ip):          # looks like an IP -> must be a valid IPv4
         octs = camera_ip.split('.')
         if not (len(octs) == 4 and all(o.isdigit() and 0 <= int(o) <= 255 for o in octs)):
             errs.append(f"--camera-ip {camera_ip!r} is not a valid IPv4 address.")
@@ -669,9 +973,10 @@ def _validate_startup(args, uid, account, password, camera_ip):
             errs.append("--volume-ramp requires --volume (the target level to ramp toward).")
     if getattr(args, 'volume_ramp_step', None) is not None and args.volume_ramp_step <= 0:
         errs.append(f"--volume-ramp-step must be > 0 (got {args.volume_ramp_step}).")
-    v = getattr(args, 'benchmark_interval', None)
-    if v is not None and v <= 0:
-        errs.append(f"--benchmark-interval must be > 0 (got {v}).")
+    for name in ('benchmark_interval',):
+        v = getattr(args, name, None)
+        if v is not None and v <= 0:
+            errs.append(f"--{name.replace('_', '-')} must be > 0 (got {v}).")
     for opt in ('record', 'snapshot', 'record_video', 'record_audio', 'record_av'):
         p = getattr(args, opt, None)
         if p:
@@ -683,6 +988,330 @@ def _validate_startup(args, uid, account, password, camera_ip):
             print("Error: " + e, file=sys.stderr)
         sys.exit(2)
     _clamp_env_knobs()
+
+
+# ══ Playback / rewind (local DVR retrieval — read-class) ════════════════════════════
+def _parse_time_arg(s, as_utc=False):
+    """Resolve a human time to epoch SECONDS. LOCAL time by default (the host's timezone, which is
+    fredde's — the camera clock is ≈UTC+1; inputs are wall-clock, converted to a UTC epoch here).
+    Accepts 'YYYY-MM-DD HH:MM[:SS]', 'HH:MM[:SS]' (today), relative '-15m'/'-2h'/'-90s', or 'now'.
+    as_utc=True interprets an ABSOLUTE string as UTC instead of local."""
+    import datetime as _dt, re as _re
+    s = (s or '').strip()
+    if s.lower() == 'now':
+        return int(time.time())
+    # relative "ago": '5m' / '90s' / '2h' / '5 min ago'. The leading '-' is OPTIONAL and the NO-DASH
+    # form is recommended — argparse treats a bare '-5m' after a flag as an option and errors; '5m'
+    # always works ('-5m' still parses when spelled --playback-from=-5m).
+    m = _re.fullmatch(r'-?\s*(\d+)\s*([smhd])[a-z ]*', s.lower())
+    if m:
+        mult = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}[m.group(2)]
+        return int(time.time()) - int(m.group(1)) * mult
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
+        try:
+            dt = _dt.datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+        if '%Y' not in fmt:                       # time-only -> today
+            td = _dt.date.today(); dt = dt.replace(year=td.year, month=td.month, day=td.day)
+        if as_utc:
+            return int(dt.replace(tzinfo=_dt.timezone.utc).timestamp())
+        return int(dt.timestamp())                # naive datetime -> HOST LOCAL time
+    raise ValueError(f"unrecognized time '{s}' — use 'YYYY-MM-DD HH:MM', 'HH:MM', or a relative '-15m'")
+
+
+def _fmt_both(epoch):
+    """One epoch as LOCAL time with UTC alongside — the anti-timezone-confusion echo."""
+    import datetime as _dt
+    loc = _dt.datetime.fromtimestamp(int(epoch)).astimezone()
+    utc = _dt.datetime.fromtimestamp(int(epoch), _dt.timezone.utc)
+    return f"{loc:%Y-%m-%d %H:%M:%S %Z} (UTC {utc:%Y-%m-%d %H:%M:%S})"
+
+
+def list_recordings(transport, hours=6):
+    """--list-recordings: pull the recent hourly manifests over RDT and print the retrievable
+    footage timeline in LOCAL time (UTC alongside). Read-class; no AV stream. The CURRENT (growing)
+    UTC hour is not served over RDT (HELLOs, no DATA), so it is skipped + flagged."""
+    import cuboai_playback as pb, datetime as _dt
+    now = int(time.time())
+    now_utc = _dt.datetime.now(_dt.timezone.utc)
+    cur_hour = now_utc.replace(minute=0, second=0, microsecond=0)
+    print("\n📼 Recorded footage timeline  (local time; UTC alongside)")
+    print("   Retention: up to ~72 h back (Gen3; older units ~18 h). Local viewing is free.")
+    print(f"   Now: {_fmt_both(now)}")
+    print(f"   ℹ the current hour ({cur_hour:%H}:00 UTC / {cur_hour.astimezone():%H}:00 local) isn't")
+    print(f"     manifest-LISTED below, but playback CAN retrieve it — footage plays right up to")
+    print(f"     ~1 min behind live. Freshest retrievable via --playback-from: ≈ {_fmt_both(now - 60)}.\n")
+    # NOTE on the manifest flake (2026-07-18): never_started (~55 HELLOs, 0 DATA) is a camera-side
+    # conn_id WEDGE that is PACING-sensitive — issuing pulls too fast reuses an unreleased RDT
+    # conn_id and starves (see the PACE_S comment below). It is NOT loss, NOT our handshake (HELLOs
+    # are byte-identical serve vs starve), NOT the resendBufferUsage gauge (which predicts nothing).
+    # Rapid retry makes it WORSE. This scan paces itself; a starved hour usually clears if you rerun
+    # the whole command after a short wait (a fresh conn_id). The honest signal is stopped_reason.
+    cov = pb.CoverageModel()
+    # PACING (2026-07-18, decode run): the manifest flake is a camera-side conn_id WEDGE, not loss
+    # and not our handshake (served vs starved HELLOs are byte-identical bar the conn_id counter).
+    # After serving/attempting an RDT transfer the camera needs TIME to release that conn_id before
+    # it can serve the next; a pull issued too soon reuses the still-open conn_id and STARVES (the
+    # camera HELLOs it forever, never sends DATA, and won't advance the counter). Evidence: back-to-
+    # back pulls (~2s) froze the camera on one conn_id → ~0 served; 120s-spaced pulls advanced the
+    # conn_id each time → ~2/3 served. RAPID RETRY MAKES IT WORSE (0/8 converted, drove the camera
+    # to no_manifest). So: ONE attempt per hour (retries=0) + a gap between hours so the camera
+    # releases each conn_id. PACE_S is deliberately conservative; a full scan trades time for
+    # reliability. Sensors (latest hour only, naturally paced) are unaffected.
+    # 2026-07-18c: the conn_id WEDGE is now FIXED at the source — RdtReceiver defaults to the native
+    # RDT_Destroy CLOSE (releases the conn_id, no freeze) + native client-initiated OPEN (retransmit-
+    # until-established). So PACE_S matches NATIVE's own gap: RDT_Destroy → Thread.sleep(500ms) → next
+    # RDT_Create. Since we now send the byte-identical CLOSE, the camera releases as fast for us as for
+    # the app, so 0.5s is the parity value (wire A/B served 5/5 at 2.5s; native proves 0.5s in the app;
+    # the intermediate isn't separately wire-pinned — raise this if a fast scan ever restarts wedging).
+    # Only fast SERVED pulls are governed by this gap; starved pulls already burn the recv timeout.
+    PACE_S = float(os.environ.get("CUBOAI_LIST_PACE_S", "0.5"))
+    # NATIVE-MATCH scan path (default ON): NativeScanSession runs a persistent single-reader thread
+    # (the native IOTC service-thread analog) so the whole scan rides ONE session with no reader gap,
+    # like the app. The camera still won't serve a 2nd DownloadFile on a session (a camera-side limit,
+    # proven even with this native architecture), so the service does a clean reader-coordinated
+    # reconnect per file — fast (~4s/hour) and, unlike the inline ioctl() reconnect, it fully quiesces
+    # the reader before the socket close/reopen (candidate fix for the macOS scan). =0 => legacy path.
+    inner = getattr(transport, "_inner", transport)
+    svc = None
+    if os.environ.get("CUBOAI_RDT_SCAN_SERVICE", "1") == "1":
+        try: svc = pb.NativeScanSession(inner).start()
+        except Exception: svc = None
+    for h in range(1, max(1, hours) + 1):         # start at 1 => skip the growing current hour
+        if h > 1 and PACE_S > 0 and svc is None:
+            time.sleep(PACE_S)                     # legacy path: let the camera release the prev conn_id
+        hdt = now_utc - _dt.timedelta(hours=h)
+        loc = hdt.astimezone()
+        # print the hour + flush BEFORE the pull so a multi-second pull never looks locked up.
+        print(f"   {loc:%Y-%m-%d %H}:00 local  (UTC {hdt:%H}:00)   …", end="", flush=True)
+        diag = {}
+        if svc is not None:
+            recs, resp = svc.download_manifest(hdt, timeout=6, diag=diag)
+        else:
+            recs, resp = pb.pull_manifest(transport, hdt, timeout=6, retries=0, diag=diag)
+        n = cov.add_manifest(recs) if recs else 0
+        # per-pull truth (workorder Step 1): order, hour, rdtChannel, stopped_reason, data, elapsed
+        reason = diag.get("stopped_reason") or "?"
+        ch = diag.get("rdtChannel")
+        det = (f"ch={ch} reason={reason} data={diag.get('data_seen')} "
+               f"hello={diag.get('hellos_seen')} cid={diag.get('first_hello_cid')}"
+               f" tries={diag.get('attempts')} bytes={diag.get('got_bytes')}/"
+               f"{diag.get('file_size')} {diag.get('elapsed', 0):.1f}s")
+        if n:
+            tag = f"✅ {n:2d}/60 min with footage"
+        elif diag.get("stopped_reason") in ("no_manifest",) or (
+                resp is not None and getattr(resp, 'file_size', 0) <= 0):
+            tag = "— no manifest (idle / not recorded)"
+        elif diag.get("stopped_reason") == "ioctl_timeout":
+            tag = "✗ 0x910 timed out (camera busy / IO window)"
+        elif diag.get("stopped_reason") == "never_started":
+            tag = "✗ RDT never started (HELLOs, no DATA)"
+        elif diag.get("stopped_reason") == "short_read":
+            tag = "✗ short read (DATA lost, unrecovered)"
+        else:
+            tag = "— (unavailable)"
+        print(f"\r   {loc:%Y-%m-%d %H}:00 local  (UTC {hdt:%H}:00)   {tag}   [{det}]")
+    if svc is not None:
+        try: svc.close()
+        except Exception: pass
+    if not cov.count:
+        print("\n   ⚠ No footage could be pulled — every hour returned never_started (HELLOs, 0 DATA).")
+        print("     The camera's RDT is wedged on a conn_id (a prior/too-fast pull it hasn't released")
+        print("     yet). WAIT ~1-2 min for it to release, then rerun (rapid retry only prolongs it;")
+        print(f"     raise CUBOAI_LIST_PACE_S above the current {os.environ.get('CUBOAI_LIST_PACE_S','8')}s to space the scan more).")
+        print("     --playback-from can still work when listing fails — it attempts the pull anyway.")
+        return
+    lo, hi = cov.span()
+    print(f"\n   ✅ Retrievable range:")
+    print(f"        earliest      : {_fmt_both(lo)}")
+    print(f"        latest LISTED : {_fmt_both(hi + 60)}   ({cov.count} minutes manifest-listed)")
+    print(f"        latest PLAYS  : ≈ {_fmt_both(now - 60)}   (current hour plays but isn't listed)")
+    print("   Retrieve any moment up to ~1 min behind live:")
+    print(f"        cuboai_validate ... --playback-from '<local time or 5m>' --playback-out clip.ts")
+
+
+def do_playback(transport, args, parser):
+    """--playback-from: retrieve recorded video+audio for a range and WRITE a playable .ts (VLC).
+    Read-class (no device state mutated). GUARANTEES live restore on EVERY exit path — normal end,
+    error, and SIGINT/SIGTERM (a human will Ctrl-C this). Validates against coverage first + echoes
+    the resolved time (local AND UTC) so a timezone slip is visible, not a phantom failure."""
+    import cuboai_playback as pb, datetime as _dt, signal, threading
+    inner = getattr(transport, "_inner", transport)
+
+    # Install the interrupt handler EARLY (before the manifest pull) so a Ctrl-C anywhere sets the
+    # stop flag instead of raising an uncaught KeyboardInterrupt. pbs may still be None here; the
+    # handler only sets the flag — the finally does the actual close()/restore once pbs exists.
+    stop_flag = threading.Event(); pbs = None; _prev = {}
+    def _handler(signum, _frame):
+        print(f"\n⚠  signal {signum} received — stopping playback and restoring live…",
+              file=sys.stderr, flush=True)
+        stop_flag.set()
+    for _s in (signal.SIGINT, signal.SIGTERM):
+        _prev[_s] = signal.signal(_s, _handler)
+    def _restore_handlers():
+        for _s, _h in _prev.items():
+            signal.signal(_s, _h)
+
+    # 1) resolve the target (LOCAL by default; --playback-utc = UTC input) + span
+    try:
+        t_from = _parse_time_arg(args.playback_from, as_utc=args.playback_utc)
+    except ValueError as e:
+        print(f"❌ --playback-from: {e}"); sys.exit(2)
+    if args.playback_to:
+        try:
+            t_to = _parse_time_arg(args.playback_to, as_utc=args.playback_utc)
+        except ValueError as e:
+            print(f"❌ --playback-to: {e}"); sys.exit(2)
+        rec_secs = t_to - t_from
+        if rec_secs <= 0:
+            print("❌ --playback-to must be AFTER --playback-from"); sys.exit(2)
+    else:
+        rec_secs = float(args.playback_duration or 30)
+    now = int(time.time())
+
+    print("\n⏪ Rewind request  (echo — check the timezone!)")
+    print(f"   from : {_fmt_both(t_from)}"
+          f"{'   [input read as UTC]' if args.playback_utc else '   [input read as LOCAL]'}")
+    print(f"   span : {rec_secs:.0f} s of recorded footage  (through {_fmt_both(t_from + int(rec_secs))})")
+
+    # 2) validate cheaply — recency + retention ONLY. We deliberately do NOT pre-pull the hourly
+    # manifest here: the 0x910/RDT pull is flaky on WiFi and its timeout TEARS DOWN the session
+    # socket (fredde's Mac: transport.ioctl disconnects on timeout → start() hit a None socket),
+    # and playback does not need it — 0x31a serves footage right up to ~30 s behind live, INCLUDING
+    # the current growing hour (whose manifest isn't served but whose minutes play). So the only
+    # gates are the recency floor (the actively-written edge, 60 s for margin) and retention; if the
+    # exact minute has no footage, the pull simply returns 0 AUs and we say so. --list-recordings
+    # is the separate "browse the range" tool.
+    RECENCY_FLOOR_S = 60
+    if t_from > now - RECENCY_FLOOR_S:
+        print(f"❌ too recent — the last ~{RECENCY_FLOOR_S}s is still being written. Ask for a moment at "
+              f"least ~1 min ago (playback serves right up to ~1 min behind live)."); sys.exit(2)
+    if now - t_from > pb.RETENTION_72H_S:
+        print(f"❌ beyond retention (~72 h). Earliest retrievable ≈ {_fmt_both(now - pb.RETENTION_72H_S)}.")
+        sys.exit(2)
+
+    # 3) warn — CORRECTLY SCOPED (2026-07-23). Playback is PER-CLIENT, not a global camera state:
+    # the camera serves DVR and live to DIFFERENT client sessions simultaneously (fredde runs DVR on
+    # his phone daily while the iPad/HA keeps streaming live, uninterrupted). So OTHER clients are NOT
+    # affected — the old "the nursery has NO live feed" was false. And this invocation only replaces a
+    # live stream it is ITSELF rendering: with the playback flags do_playback returns BEFORE the
+    # --stream-video path, so a bare rewind has no local live output to interrupt. Only warn about an
+    # interruption when this session is actually streaming; otherwise just clarify the per-client scope.
+    if args.stream_video:
+        print(f"\n⚠  THIS SESSION's live stream will be replaced by recorded footage for ~{rec_secs:.0f}s; "
+              "it is restored automatically on exit (including Ctrl-C).", file=sys.stderr, flush=True)
+        print("   (Per-client: OTHER devices — iPad / Home Assistant — keep their own live feed.)",
+              file=sys.stderr, flush=True)
+    else:
+        print("\nℹ  Playback is per-client — retrieving recorded footage here does NOT interrupt live on "
+              "other devices (iPad / Home Assistant). This invocation isn't streaming, so nothing local "
+              "is interrupted; the session's live channel is restored on exit.", file=sys.stderr, flush=True)
+
+    if stop_flag.is_set():          # cancelled during the manifest pull — playback never started
+        _restore_handlers()
+        print("\n(cancelled before playback started; live was not interrupted.)")
+        return
+
+    # A timed-out 0x910 manifest pull makes transport.ioctl DISCONNECT the session socket (its
+    # timeout path calls disconnect(), leaving inner._sock=None) — seen on fredde's Mac/WiFi as
+    # "'NoneType' has no attribute 'sendto'" when start() tried to send. The manifest is only an
+    # advisory coverage hint (playback doesn't need it), so revive the session before playing.
+    if getattr(inner, '_sock', None) is None:
+        print("   ⚠ session socket dropped during the manifest pull — reconnecting…",
+              file=sys.stderr, flush=True)
+        try:
+            transport.connect()
+        except Exception as e:
+            _restore_handlers()
+            print(f"❌ could not reconnect after the manifest timeout: {e}")
+            sys.exit(2)
+
+    out_path = os.path.expanduser(args.playback_out)
+    pbs = pb.PlaybackSession(transport, log=lambda *a: print("   [pb]", *a, flush=True))
+    wall0 = time.time(); summary = None; served_target = t_from
+    try:
+        # 0x31a can return -1 (refused) when the exact moment is momentarily too fresh (the
+        # record→playable lag varies), so back off to slightly older targets before giving up.
+        # A persistent -1 across all backoffs is usually a BUSY camera (the app/another viewer is
+        # open) or an unreleased prior session — reported clearly below.
+        # start() retries the SAME target patiently (~8×, for the fresh-footage-finalizing -1). If
+        # even that fails, fall back ONCE to a target 2 min older (settled footage always plays).
+        N = None
+        for back in (0, 120):
+            if stop_flag.is_set():
+                break
+            try:
+                N = pbs.start(t_from - back, disable_timecontrol=0)   # real-time pacing (dtc tested lossy)
+                served_target = t_from - back
+                if back:
+                    print(f"   ⚠ the requested moment was still refused after retries; served {back}s "
+                          f"earlier ({_fmt_both(served_target)}) instead.", file=sys.stderr, flush=True)
+                break
+            except RuntimeError as e:
+                if 'rejected' in str(e).lower() and back < 120:
+                    time.sleep(0.6); continue
+                raise
+        print(f"   channel N assigned: {N}", flush=True)
+        wall_cap = rec_secs * 3.0 + 25              # safety cap (idle_timeout also ends EOS)
+        with open(out_path, "wb") as w:
+            summary = pb.mux_playback_stream(pbs, w, record_seconds=rec_secs, duration=wall_cap,
+                                             stop_flag=stop_flag,
+                                             log=lambda *a: print("   [mux]", *a, flush=True))
+    except Exception as e:
+        if 'rejected' in str(e).lower():
+            print("❌ the camera REFUSED playback for that time (result -1), even a few minutes back.",
+                  file=sys.stderr)
+            print("   Most likely: the CuboAI APP or another viewer is open — CLOSE it, then retry.",
+                  file=sys.stderr)
+            print("   Also try: a time further back (e.g. --playback-from 10m), or wait ~60 s for a",
+                  file=sys.stderr)
+            print("   previous session to release.", file=sys.stderr)
+        else:
+            print(f"❌ playback error: {e!r}", file=sys.stderr)
+    finally:
+        try:
+            pbs.close(restore_live=True)              # GUARANTEED live restore (every exit path)
+        except Exception as e:
+            print(f"   ⚠ live restore raised: {e!r}", file=sys.stderr)
+        _restore_handlers()
+    wall = time.time() - wall0
+
+    # 4) summary fredde can sanity-check
+    print("\n📊 Playback result")
+    print(f"   channel N     : {getattr(pbs, 'channel', None)}")
+    if summary:
+        vlo, vhi = summary['v_ts_min'], summary['v_ts_max']
+        print(f"   video AUs     : {summary['video']}  (keyframes {summary['keyframes']})")
+        print(f"   audio AUs     : {summary['audio']}")
+        if vlo:
+            print(f"   1st frame ts  : {_fmt_both(vlo)}")
+            print(f"   last frame ts : {_fmt_both(vhi)}")
+            drift = vlo - served_target
+            print(f"   → {'✅ CONTENT IS FROM THE PAST' if abs(drift) <= 300 and (now - vlo) > 60 else '⚠ CHECK'}: "
+                  f"first frame {drift:+d}s vs served target, and {now - vlo}s before now (not ≈live).")
+        elif summary['video'] == 0:
+            print("   → ⚠ NO recorded frames arrived. Either the camera has no footage for that exact "
+                  "time, or the request didn't engage. Try a nearby time, or --list-recordings.")
+        print(f"   pacing        : real-time (camera paces playback; wall ≈ footage span)")
+    print(f"   wall time     : {wall:.1f}s")
+    try:
+        sz = os.path.getsize(out_path)
+    except OSError:
+        sz = 0
+    print(f"   output        : {out_path}  ({sz / 1024:.0f} KiB)")
+    if stop_flag.is_set():
+        print("   (stopped early by signal)")
+
+    # 5) confirm live restored + healthy
+    try:
+        n = 0
+        for k, _u, _fi in inner.av_frames_timed(duration=4.0):
+            if k == 'video':
+                n += 1
+        print(f"   live restored : {'✅ healthy' if n else '⚠ NO live frames — check the app!'} ({n} AUs)")
+    except Exception as e:
+        print(f"   live restored : ⚠ confirm failed: {e!r}")
 
 
 def main():
@@ -699,14 +1328,14 @@ def main():
     conn.add_argument('--camera-ip', metavar='IP',   help='Camera LAN IP (enables broadcast redirect on Linux)')
     conn.add_argument('--channels',  metavar='DIGITS', default=None,
                       help='(pure backend) AV channels to open as single digits, e.g. "0123", "01", "1"; '
-                           'default (omitted) = ch0..39, the full av-connect channel set')
+                           'default (omitted) = ch0..39, native\'s full av-connect set (S70)')
     conn.add_argument('-v', '--verbose', action='store_true',
                       help='(pure backend) print a connect/stream trace (channels, grant, ACK/gap state)')
     # defer-start (pure backend) — same naming/default as cuboai_stream_video. By DEFAULT video
     # starts fast (0x0300+0x01FF up front, first frame in ~0.5-2 s) so short captures don't race a
     # ~5 s window. --defer-start re-enables the deliberate ~5 s native startup defer for wire-
-    # fidelity. The wire-fidelity behaviour (ACK timestamp / NAK cadence / SACK list) stays ON
-    # either way — it affects resend efficiency, never whether AV works.
+    # fidelity. The S82 wire-fidelity (ACK timestamp / NAK cadence / SACK list) stays ON either way —
+    # it affects resend efficiency, never whether AV works.
     conn.add_argument('--defer-start', action='store_true',
                       help='(pure backend) re-enable the ~5 s native startup defer (wire-fidelity); '
                            'default starts video immediately. Also via CUBOAI_DEFER_START=1.')
@@ -743,7 +1372,7 @@ def main():
     parser.add_argument('--play',        metavar='NAME',              help='Play lullaby by name')
     parser.add_argument('--stop',        action='store_true',         help='Stop lullaby')
     parser.add_argument('--sleep-mode',  choices=['on','off'],        help='Sleep/privacy mode')
-    # ── additional SET commands ────────────────────────────────────────────
+    # ── new SET commands (2026-05-31) ──────────────────────────────────────
     setg = parser.add_argument_group("SET commands (new)")
     setg.add_argument('--night-vision', choices=['auto','on','off'],
                       help='Night-vision/IR mode (SET_HW_CONTROL; accepted but firmware-managed on this device)')
@@ -787,13 +1416,33 @@ def main():
     setg.add_argument('--humi-low',   type=int, metavar='PCT', help='Environment: low humidity threshold (pct)')
     setg.add_argument('--humi-high',  type=int, metavar='PCT', help='Environment: high humidity threshold (pct)')
 
-    # ── GATED / UNSAFE writes (require --i-understand-this-is-unsafe) ───────────
-    # The lullaby SCHEDULE-table writer (SET_LULLABY_SCHEDULE 0x0990) is RE'd but
-    # UNTESTED on the live camera — it adds/deletes a schedule row in device state.
-    # Hidden behind the unsafe gate until a live add/read-back/app-confirm passes.
-    gate = parser.add_argument_group("Gated writes (UNSAFE / untested — require --i-understand-this-is-unsafe)")
+    # ── Lullaby schedule writes (SET_LULLABY_SCHEDULE 0x0990) ───────────────────
+    # LIVE-CONFIRMED (2026-07-10): add + delete store exactly and are honored by the app, and the
+    # duration round-trips correctly since the tail-Swap transcode fix. So the old
+    # --i-understand-this-is-unsafe gate is REMOVED from these rows. The flag itself is kept (a
+    # reserved acknowledgement gate) for any genuinely destructive future write; it is a no-op today.
+    pbg = parser.add_argument_group("Playback / rewind (local DVR — READ-class; per-client)")
+    pbg.add_argument('--list-recordings', action='store_true',
+                     help='Print the retrievable footage timeline (local time + UTC). Standalone.')
+    pbg.add_argument('--list-hours', type=int, default=6, metavar='N',
+                     help='How many past hours to scan for --list-recordings (default 6).')
+    pbg.add_argument('--playback-from', metavar='T',
+                     help="Rewind START. LOCAL time by default: 'YYYY-MM-DD HH:MM', 'HH:MM' (today), "
+                          "or relative '5m' = 5 min ago (no leading dash). Add --playback-utc for UTC.")
+    pbg.add_argument('--playback-to', metavar='T',
+                     help='Rewind END time (same formats). Overrides --playback-duration.')
+    pbg.add_argument('--playback-duration', type=float, default=30, metavar='SECS',
+                     help='Seconds of RECORDED footage to retrieve from --playback-from (default 30). '
+                          'No FF/pause/speed in the protocol — this is footage span.')
+    pbg.add_argument('--playback-out', metavar='FILE',
+                     help='Write the playable .ts here (open in VLC on the Mac).')
+    pbg.add_argument('--playback-utc', action='store_true',
+                     help='Interpret --playback-from/--playback-to as UTC instead of local time.')
+
+    gate = parser.add_argument_group("Lullaby schedule (SET_LULLABY_SCHEDULE 0x0990 — live-confirmed add/delete)")
     gate.add_argument('--i-understand-this-is-unsafe', dest='unsafe', action='store_true',
-                      help='Acknowledge the gated writes below are untested and modify device state.')
+                      help='Reserved acknowledgement gate for genuinely destructive writes; currently a '
+                           'no-op (the lullaby-schedule writes below are live-confirmed and un-gated).')
     gate.add_argument('--add-lullaby-schedule', metavar='SONG',
                       help='Add a lullaby schedule playing SONG (catalog name or UUID). '
                            'Use with --schedule-name/--schedule-start/--schedule-duration/'
@@ -816,7 +1465,11 @@ def main():
                       help='Send start time as LOCAL wall-clock (sets the nMDay 0x80 '
                            'use-local-time bit) instead of verbatim/UTC.')
     parser.add_argument('--list-songs',  action='store_true',         help='List all songs')
-    parser.add_argument('--no-status',   action='store_true',         help='Skip the status read (status and AV streaming coexist)')
+    parser.add_argument('--no-status',   action='store_true',         help='Skip status read (optional since session 24; status + AV now coexist)')
+    parser.add_argument('--history',     action='store_true',         help='Append the s_log detection-history section + charts to --status (an RDT manifest pull; OPT-IN because it does NOT coexist with a live stream — proven to fail its pull + disturb the feed. Use only when no stream is active.)')
+    parser.add_argument('--history-hours', type=int, default=1, metavar='N', help='How many hours of s_log to retrieve+chart for --history (default 1 = the current growing hour, a single pull). >1 pulls + merges older hours (paced).')
+    parser.add_argument('--history-chart', metavar='FILE', help='Also write a standalone self-contained HTML chart of the --history window to FILE (inline SVG per numeric series; open in any browser).')
+    parser.add_argument('--history-raw-keys', action='store_true', help='Diagnostic (read-only, standalone): pull the manifest and report the RAW s_log key set the firmware emits vs what we model (settles whether ni/nm/se/ve etc. are actually present). Honors --history-hours.')
 
     # ── WiFi-placement / performance benchmark (read-only) ─────────────────
     bench = parser.add_argument_group("Benchmark (WiFi placement & performance)")
@@ -921,19 +1574,18 @@ def main():
         parser.error("--volume must be 0-100")
     if args.talk_gain < 0:
         parser.error("--talk-gain must be >= 0 (1.0 = unchanged, <1 quieter, >1 louder)")
+    if args.playback_from and not args.playback_out:
+        parser.error("--playback-from requires --playback-out FILE (the .ts to write)")
 
-    # ── Gate: the lullaby-schedule writes are untested + modify device state ──
-    if (args.add_lullaby_schedule or args.delete_lullaby_schedule) and not args.unsafe:
-        parser.error("--add-lullaby-schedule / --delete-lullaby-schedule write to the "
-                     "live camera and are UNTESTED — pass --i-understand-this-is-unsafe "
-                     "to proceed.")
+    # Lullaby-schedule writes are LIVE-CONFIRMED (add/delete store exactly, duration honored since the
+    # tail-Swap fix) — no longer gated. The --i-understand-this-is-unsafe flag is retained but a no-op.
 
     # ── Connect ──────────────────────────────────────────────────
-    channels = [int(c) for c in args.channels] if args.channels else None   # AV channels (None = all)
+    channels = [int(c) for c in args.channels] if args.channels else None   # S62
     # defer-start: same naming/default as cuboai_stream_video. Default = start fast (_defer=False, so
     # 0x0300+0x01FF go up front and the first frame lands in ~0.5-2 s — short captures don't race a
     # ~5 s window). --defer-start (or CUBOAI_DEFER_START) re-enables the ~5 s native defer (_defer=None
-    # → follow full_fidelity). full_fidelity (ACK ts / NAK cadence / SACK) stays ON either way.
+    # → follow full_fidelity). full_fidelity (S82 ACK ts / NAK cadence / SACK) stays ON either way.
     defer  = args.defer_start or os.environ.get('CUBOAI_DEFER_START', '0') != '0'
     _defer = None if defer else False
     # Install the same A/V env profile cuboai_stream_video ships: default = production (FRAMEINFO
@@ -969,8 +1621,20 @@ def main():
                           cap=(args.benchmark or None), csv_path=args.benchmark_csv)
             return
 
+        # ── Playback / rewind (read-class; each returns, skipping status/SETs) ──
+        if args.list_recordings:
+            list_recordings(transport, hours=args.list_hours)
+            return
+        if args.playback_from:
+            do_playback(transport, args, parser)
+            return
+        if args.history_raw_keys:
+            dump_history_raw_keys(transport, hours_back=args.history_hours)
+            return
+
         if not args.no_status:
-            print_status(transport)
+            print_status(transport, history=args.history,
+                         history_hours=args.history_hours, history_chart=args.history_chart)
 
         # ── Snapshot ─────────────────────────────────────────────
         if args.snapshot:
@@ -1219,7 +1883,7 @@ def main():
             except Exception as e: print(f"   ❌ Failed: {e}")
 
         # ── Cry / cough detection ────────────────────────────────
-        # sensitivity labels map INVERTED to the wire: low=3, medium=2, high=1.
+        # sensitivity labels map INVERTED to the wire: low=3, medium=2, high=1 (S28).
         _SENS = {'low': 3, 'medium': 2, 'high': 1}
         if args.cry_detection or args.cry_sensitivity is not None:
             cur = transport.get_cry_detection()
@@ -1240,7 +1904,7 @@ def main():
 
         # ── Sleep-safety mode (high-level: mutually-exclusive radio) ──
         # safety_alert=1,cover=0 → "Covered Face + Rollover"; cover=1,safety=0 →
-        # "Covered Face Only"; both 0 → off.
+        # "Covered Face Only"; both 0 → off  (S28, APK switchSleepSafetyDetectionType).
         if args.sleep_alerts:
             sa, ca = {'covered-and-rollover': (1, 0),
                       'covered-only':         (0, 1),
@@ -1284,11 +1948,12 @@ def main():
         # ── Lullaby schedule TABLE add/delete (gated; SET_LULLABY_SCHEDULE 0x0990) ──
         if args.delete_lullaby_schedule:
             print(f"\n🗑  Delete lullaby schedule '{args.delete_lullaby_schedule}'...", flush=True)
-            try:    transport.delete_lullaby_schedule(args.delete_lullaby_schedule); print("   ✅ Sent (UNTESTED — confirm via read-back + app)")
+            try:    transport.delete_lullaby_schedule(args.delete_lullaby_schedule); print("   ✅ Sent (live-confirmed; verify via read-back + app if desired)")
             except Exception as e: print(f"   ❌ Failed: {e}")
         if args.add_lullaby_schedule:
             song = args.add_lullaby_schedule
             sname = args.schedule_name or song
+            # parse start HH:MM
             sh, sm = 0, 0
             if args.schedule_start:
                 try:
@@ -1296,6 +1961,7 @@ def main():
                     sh, sm = int(hh), int(mm)
                 except Exception:
                     parser.error("--schedule-start must be HH:MM")
+            # parse day mask: 'all'/'everyday' → 0x7f, else decimal or 0xNN
             dspec = (args.schedule_days or 'all').strip().lower()
             if dspec in ('all', 'everyday', 'mon-sun', 'daily'):
                 dmask = 0x7f
@@ -1313,7 +1979,7 @@ def main():
                     sname, song=song, days_mask=dmask, start_hour=sh, start_minute=sm,
                     duration_min=args.schedule_duration, enable=not args.schedule_disable,
                     ai=(args.schedule_ai == 'on'), use_local_time=args.schedule_local_time)
-                print("   ✅ Sent (UNTESTED — confirm via read-back + app)")
+                print("   ✅ Sent (live-confirmed; verify via read-back + app if desired)")
             except Exception as e:
                 print(f"   ❌ Failed: {e}")
 

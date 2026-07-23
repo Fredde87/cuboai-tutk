@@ -26,7 +26,9 @@ Validated against a **CuboAI Gen 3** camera (firmware 3.0.1369). Other models / 
 | Status LED | ✅ |
 | Lullaby play / stop / select (34 songs) | ✅ |
 | Lullaby volume + sleep timer | ✅ |
-| Lullaby schedule | ✅ read |
+| Lullaby schedule (read + add / delete rows) | ✅ read + write (add/delete **live-confirmed**) |
+| **Local DVR playback / rewind** (on-camera storage, no cloud) | ✅ retrieve a past moment to a playable `.ts` |
+| **Detection history** (per-minute in-crib presence, motion, noise avg+peak, night-vision, temp/humidity) | ✅ read + ASCII / HTML charts |
 | Sleep / privacy mode (suspends video) | ✅ |
 | Cry / sleep-safety / cough detection status | ✅ read |
 | Cry / cough detection sensitivity | ✅ set (gated) |
@@ -173,6 +175,62 @@ Control commands: `--night-light`, `--brightness`, `--volume`, `--timer`, `--pla
 > **Talk is pure-backend only** — the native `--lib` TUTK 4.2.1.1 library omits the 4.3.x av-server
 > capability the camera's talk handshake needs, so `--talk` is rejected in `--lib` mode.
 
+### Local DVR playback / rewind (on-camera, no cloud)
+
+The camera keeps a continuous on-device recording (internal storage; ~18–72 h retention depending
+on model). You can browse and retrieve past footage **locally over the LAN** — there is no cloud on
+this path and no subscription is involved (the paywalled "Moments/Memory" HLS product is a separate
+thing this project does not touch).
+
+```bash
+# List which past hours have retrievable footage (local time + UTC)
+python3 cuboai_validate.py ... --camera-ip 192.0.2.10 --list-recordings --list-hours 6
+
+# Retrieve ~30 s of footage from a past moment to a playable .ts (open in VLC)
+python3 cuboai_validate.py ... --playback-from "14:05" --playback-duration 30 --playback-out clip.ts
+#   --playback-from accepts 'YYYY-MM-DD HH:MM', 'HH:MM' (today), or relative '5m' (5 min ago);
+#   times are LOCAL by default (add --playback-utc for UTC). There is no fast-forward/pause/speed
+#   in the protocol — this retrieves a span of recorded footage, not an interactive scrubber.
+```
+
+Playback is **per client**: retrieving footage on one session does not interrupt the live feed on
+other devices (your phone app, another Home Assistant client, …). A session that is *also* streaming
+live has its own live stream briefly replaced by the recorded footage; it is restored automatically
+on exit (including Ctrl-C).
+
+### Detection history — LOCAL history, not a live reading
+
+`--history` appends a per-minute **detection history** to the status card, pulled from the same
+on-camera DVR manifest. Each field below was verified against real footage:
+
+| field | meaning |
+| --- | --- |
+| baby in crib | detected in the crib (the app's white timeline bar) vs out |
+| motion | still / moving |
+| noise (avg + peak) | per-minute average and peak sound level |
+| night vision | IR / dark vs daylight — *the official app does not surface this* |
+| temperature / humidity | environment |
+| sleep / privacy | recording vs privacy mode |
+
+(The manifest also carries a firmware "activity" bit and a couple of structural counters that the app
+uses only for internal timeline shading — surfaced raw, unlabelled.) Every value is labelled with its
+reading time and **age**, and the whole section is marked *history* — deliberately kept separate from the
+live sensors so a stale reading can never be mistaken for "now". `--history-hours N` widens the retrieved
+window; `--history-chart FILE` writes a standalone self-contained HTML chart (inline SVG per numeric
+series) alongside the terminal ASCII sparklines; `--history-raw-keys` dumps the raw manifest key set.
+
+```bash
+python3 cuboai_validate.py ... --camera-ip 192.0.2.10 --history --history-hours 1 --history-chart hist.html
+```
+
+> **What is NOT available locally.** The app's headline AI detections — **cry, cough, movement, caregiver
+> visit, rollover, and face-covered** — are **cloud** products (server-computed sleep analysis fetched from
+> Cubo's REST API with a cloud account token), *not* in the local DVR manifest. A camera-only local client
+> like this one cannot reproduce them. What you get locally is the environmental / coarse-state set above —
+> including night-vision and peak-noise, which the official app itself doesn't even display.
+> **Note:** `--history` performs an RDT manifest pull that does not coexist with a live stream — run it
+> when no stream from this same session is active.
+
 ### Wi-Fi placement & performance benchmark
 
 `--benchmark` streams while sampling link quality, so you can compare camera
@@ -214,11 +272,13 @@ cuboai_session.py       — get_session() factory (pure by default; --lib / CUBO
 cuboai_messages.py      — IOCTL / Kalay message builders + parsers
 cuboai_pts.py           — per-frame PTS clock + shared-base A/V timeline
 cuboai_mpegts.py        — MPEG-TS muxer (HEVC video + AAC audio)
+cuboai_playback.py      — local DVR: on-camera recording discovery, RDT manifest pull, rewind playback
 cuboai_stream_video.py  — go2rtc exec entry point: combined A/V MPEG-TS to stdout
-cuboai_validate.py      — example CLI: snapshot, record, status card, controls, Wi-Fi benchmark
+cuboai_validate.py      — example CLI: snapshot, record, status card, controls, DVR/history, Wi-Fi benchmark
 cuboai_tutk.py          — optional native TUTK backend (ctypes); not needed for normal use
 cubo_go2rtc.sh          — go2rtc exec wrapper script
 go2rtc.yaml             — example go2rtc stream config
+tools/cubo_pcap_decode.py — dev tool: decode a camera pcap into labelled RDT / IOCTL / AV frames
 PROTOCOL_RESEARCH.md    — how the LAN protocol works (wire formats + what we learned)
 ```
 

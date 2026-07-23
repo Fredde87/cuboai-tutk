@@ -1,32 +1,35 @@
 """
-cuboai_session.py — Session factory for CuboAI cameras.
+cuboai_session.py — Session factory for CuboAI camera.
 
 Two interchangeable backends implement the same session interface:
-  - PureSession  (cuboai_transport_py.py) — pure Python, no native library. This is
-                                            the default and the focus of this library.
-  - TUTKSession  (cuboai_tutk.py)         — optional native TUTK library via ctypes,
-                                            used only if you supply your own library.
+  - TUTKSession  (cuboai_tutk.py)        — native TUTK library via ctypes (full AV stack)
+  - PureSession  (cuboai_transport_py.py) — pure Python, no library (LAN handshake WORKING)
 
 Usage:
     from cuboai_session import get_session
 
     sess = get_session(uid, account, password,
-                       lib_path=None,           # None = pure Python (recommended)
-                       camera_ip='192.0.2.10')  # the camera's LAN IP
+                       lib_path=None,           # None = prefer pure Python
+                       camera_ip='192.0.2.x')
     with sess:
-        print(type(sess).__name__)              # PureSession or TUTKSession
+        print(type(sess).__name__)              # TUTKSession or PureSession
         print(sess.session_hdr.hex())           # 16-byte session token (both backends)
 
 Backend selection:
-    lib_path given               -> TUTKSession  (explicit native library)
-    lib_path omitted, lib found  -> TUTKSession  (auto-detected in a standard install path)
-    lib_path omitted, none found -> PureSession  (pure Python; the normal case)
+    --lib specified              → TUTKSession  (explicit native library)
+    --lib omitted, lib found     → TUTKSession  (auto-detected in a standard install path)
+    --lib omitted, no lib found  → PureSession  (pure Python — connect WORKING)
 
-The pure backend connects directly over the LAN with no native library and no relay,
-deriving the 16-byte session_hdr, and runs the full AV stack (ioctl, snapshot, video/audio
-streaming, and two-way talk via send_audio_file) in pure Python. Two-way talk is PURE-ONLY:
-the native (--lib) backend can't perform the camera's talk handshake, so its send_audio_file
-raises NotImplementedError.
+Status of PureSession (full stack solved 2026-05-30, sessions 9–12):
+    ✅ Connection handshake WORKING — connects over LAN with no native library and
+       derives the 16-byte session_hdr. There is NO relay and NO crypto on connect
+       (100% LAN, direct UDP, security_mode 0); the earlier "51cc ECDH relay
+       handshake" theory was wrong. See HANDOFF.md / PROTOCOL_RESEARCH.md.
+    ✅ AV layer WORKING — ioctl, snapshot, video/audio streaming, AND two-way talk
+       (send_audio_file) all run in pure Python; verified live. The pure backend is the
+       default when no --lib is given. Two-way talk is PURE-ONLY: the native (--lib) TUTK
+       4.2.1.1 lib can't perform the camera's 4.3.x talk handshake, so send_audio_file
+       there raises NotImplementedError.
 """
 
 from __future__ import annotations
@@ -88,34 +91,35 @@ def get_session(uid: str,
     """Return the appropriate session backend, printing which one is selected.
 
     Args:
-        uid:        Device UID (the license_id field from the account's camera list).
-        account:    Device admin id (e.g. admin@YOUR_ACCOUNT).
-        password:   Device admin password.
-        lib_path:   Path to a native libIOTCAPIs_ALL library. If given, the native
-                    backend is used. If None, a standard install path is checked; if
-                    no library is found, the pure-Python backend is used.
-        camera_ip:  Camera LAN IP (recommended for a reliable LAN connection).
-        channels:   (pure backend) AV channel set to open, e.g. [0,1] or [1].
-                    None = the default [0,1,2,3]. Ignored by the native backend.
-        verbose:    (pure backend) print a connect/stream trace. Native ignores it.
-        full_fidelity: (pure backend) when True (default), the client byte-matches the
-                    native app on the wire (ACK timestamp, NAK cadence, SACK list, and
-                    IOCTL cadence). When False, it uses a simpler, lower-latency path
-                    (~0.5 s time-to-first-frame). Streaming works either way; this only
-                    affects wire fidelity and startup latency.
-        defer_stream_start:     (pure backend) delay the stream-start message by ~5 s.
-                    None (default) follows full_fidelity; pass True/False to override
-                    just this stage.
-        defer_video_start_late: (pure backend) delay the video START message by ~5 s.
-                    None (default) follows full_fidelity; pass True/False to override.
+        uid:        Device UID (license_id from REST API)
+        account:    dev_admin_id (e.g. admin@YOUR_ACCOUNT)
+        password:   dev_admin_pwd
+        lib_path:   Path to libIOTCAPIs_ALL.so. If given → native. If None, a
+                    standard install path is checked; if none is found → pure Python.
+        camera_ip:  Camera LAN IP (recommended for reliable LAN connection).
+        channels:   (pure backend, S62) AV channel set to open, e.g. [0,1] or [1].
+                    None = native default [0,1,2,3]. Ignored by the native backend.
+        verbose:    (pure backend, S62) print a connect/stream trace. Native ignores.
+        full_fidelity: (pure backend, S82) MASTER wire-fidelity flag. True (default,
+                    per the "always match native" preference) = byte-match native on the
+                    ACK timestamp [48:52], NAK pair cadence, SACK list AND the S81 IOCTL
+                    cadence. False (the --fast-start path) reverts all of these to the
+                    simpler/faster pre-S82 behaviour (~0.5 s TTFF). Arming is firmware-
+                    gated either way, so it changes only wire-fidelity/latency.
+        defer_stream_start:     (pure backend, S81) defer 0x0300 (stream-start) ~5 s
+                    after 0x00FF. None (default) = FOLLOW full_fidelity; True/False
+                    overrides just this stage (e.g. fidelity ON but fast video start).
+        defer_video_start_late: (pure backend, S81/S71) defer 0x01FF (START) ~5 s after
+                    0x0300. None (default) = FOLLOW full_fidelity; True/False overrides.
 
     Returns:
         TUTKSession or PureSession instance (both support the context manager and
         expose .connect()/.disconnect()/.session_hdr).
     """
-    # auto_discover_lib=False forces pure Python unless an EXPLICIT lib_path is given, so a
-    # stray or wrong-vendor libIOTCAPIs_ALL library in a standard path can never silently
-    # override pure mode. Callers that want auto-detection leave it at the default (True).
+    # auto_discover_lib=False forces pure Python unless an EXPLICIT lib_path is given. The
+    # streaming deployment uses this so a stray/wrong-vendor libIOTCAPIs_ALL.so sitting in ~ or a
+    # standard path can never silently override pure mode (the local .so here is a WYZE build, the
+    # wrong vendor for this camera). Other callers keep the original auto-detect behaviour.
     resolved = lib_path or (_find_library() if auto_discover_lib else None)
     if resolved:
         from cuboai_tutk import TUTKSession

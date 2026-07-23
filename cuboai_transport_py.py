@@ -1,19 +1,28 @@
 # cuboai_transport_py.py
 """Pure Python CuboAI camera session — no native library required.
 
-PureSession provides the same interface as the native TUTKSession but is implemented
-entirely in Python: connect, ioctl (multiple IOCTLs on one connection), snapshot, and
-av_frames / video_frames / audio_frames. Only two-way audio (send_audio_file) is a
-stub.
+STATUS: FULLY WORKING (pure Python, no native library) as of 2026-05-30 session 12.
+        connect + ioctl (multi-IOCTL on one connection) + snapshot + av_frames/
+        video_frames/audio_frames all verified live. Only two-way audio
+        (send_audio_file) remains a stub. See AV_HANDOFF.md.
 
-The connection is a direct LAN UDP handshake — no relay server and no crypto on
-connect. Once connected, session_hdr (the 16-byte AV-login token) is available and the
-AV layer streams over the same socket.
+Root cause of the long investigation: the LAN-search probe/ACK plaintext block
+[48:64] encodes transcode(R + _AV_MID client fingerprint), NOT a random nonce.
+The camera uses (R | fingerprint) as the client-random-id to look up the
+pre-session slot (__Search_(Pre)SessionByClientRandomID) and then drives the
+session to "connected" (gSessionInfo+0x19 == 2) via LAN_SEARCH_R_3 -> _SetSendPath.
+The old code scribbled garbage into that region, so status never reached 2 and the
+av-connect was silently dropped.
+
+Fix (in cuboai_pure.py): build_probe(uid, R) / build_ack(uid, R) via transcode with
+the correct _AV_MID fingerprint, and gen_R() picks a fresh R per attempt to avoid
+the ~20 s CheckRecentClientRandomID dedup window. There is NO relay and NO crypto on
+connect — it is 100% LAN, direct UDP (security_mode 0). (The earlier "51cc ECDH relay
+handshake" theory was wrong; see HANDOFF.md.)
 
 Architecture:
-  PureSession is a thin wrapper around cuboai_pure.TUTKDirectSession, which implements
-  the handshake and the AV transport. This module adapts that into the session API
-  (context manager, ioctl, snapshot, frame iterators) shared with the native backend.
+  PureSession wraps cuboai_pure.TUTKDirectSession for the handshake. Once connected,
+  session_hdr (the 16-byte AV-login token) is available for the future AV layer.
 """
 
 from __future__ import annotations
@@ -37,7 +46,7 @@ class PureSession:
     remains a stub.
 
     Usage:
-        sess = PureSession(uid, account, password, camera_ip='192.0.2.10')
+        sess = PureSession(uid, account, password, camera_ip='192.0.2.x')
         with sess:
             print(sess.session_hdr.hex())   # 16-byte session token
             tc, data = sess.ioctl(*build_get_hw_control())
@@ -51,32 +60,31 @@ class PureSession:
         self.uid       = uid
         self.account   = account
         self.password  = password
-        if not camera_ip:
-            raise ValueError("camera_ip is required, e.g. PureSession(..., camera_ip='192.0.2.10')")
         self.camera_ip = camera_ip
         # cuboai_pure.TUTKDirectSession signature is
         #   (camera_ip, camera_port, account, password, uid) — pass by keyword,
         # and the builders need bytes for account/password.
         self._inner = TUTKDirectSession(
-            camera_ip=camera_ip,
+            camera_ip=camera_ip or "192.0.2.10",
             account=_as_bytes(account),
             password=_as_bytes(password),
             uid=_as_bytes(uid),
-            channels=kwargs.get('channels'),     # AV channel set (None = [0,1,2,3])
-            verbose=kwargs.get('verbose', False), # print a connect/stream trace
-            # full_fidelity is the master wire-fidelity flag (default True = byte-match the
-            # native app: IOCTL cadence, ACK timestamp, NAK cadence, SACK list). The cadence
-            # sub-flags default to None => follow full_fidelity; pass an explicit bool to
-            # override just that stage. Set full_fidelity False for the low-latency path
-            # (~0.5 s time-to-first-frame).
+            channels=kwargs.get('channels'),     # S62: AV channel set (None = [0,1,2,3])
+            verbose=kwargs.get('verbose', False), # S62: connect/stream trace
+            # S82: full_fidelity is the master wire-fidelity flag (default True = match
+            # native). It folds in the S81 IOCTL cadence + gates the ACK timestamp / NAK
+            # cadence / SACK list. The cadence sub-flags default to None => follow
+            # full_fidelity; pass an explicit bool to override just that stage. Set
+            # full_fidelity False (e.g. --fast-start) for the low-latency path (~0.5 s TTFF).
             full_fidelity=kwargs.get('full_fidelity', True),
             defer_stream_start=kwargs.get('defer_stream_start', None),
             defer_video_start_late=kwargs.get('defer_video_start_late', None),
         )
         self.session_hdr: Optional[bytes] = None
-        # Single-frame API state (start_video/recv_frame/recv_audio_frame): one shared
-        # AV iterator drains both streams (the camera stops sending audio unless video is
-        # consumed too), and per-kind buffers hand frames back one at a time.
+        # legacy single-frame API state (start_video/recv_frame/recv_audio_frame):
+        # one shared AV iterator drains both streams (the camera stops sending
+        # unless video is consumed too — see PROTOCOL_RESEARCH "audio requires
+        # video drain"); per-kind buffers hand frames back one at a time.
         self._av_iter: Optional[Iterator] = None
         self._vbuf: list = []
         self._abuf: list = []
@@ -127,7 +135,7 @@ class PureSession:
     def get_cough_detection(self) -> dict:   return self._inner.get_cough_detection()
     def check_firmware_update(self) -> dict: return self._inner.check_firmware_update()
     def get_connected_users(self) -> dict:   return self._inner.get_connected_users()
-    # additional GET controls
+    # new GETs (2026-05-31) — all confirmed responding on fw 3.0.1369
     def get_temp_humidity(self) -> dict:        return self._inner.get_temp_humidity()
     def get_night_light(self) -> dict:          return self._inner.get_night_light()
     def get_status_light(self) -> dict:         return self._inner.get_status_light()
@@ -138,7 +146,7 @@ class PureSession:
     def get_lullaby_schedule(self) -> dict:     return self._inner.get_lullaby_schedule()
     def get_light_way_config(self) -> dict:     return self._inner.get_light_way_config()
     def get_detection_zone_v2(self) -> dict:    return self._inner.get_detection_zone_v2()
-    # further GET controls
+    # second 2026-05-31 batch (APK-DEX-extracted, live-confirmed on fw 3.0.1369)
     def get_event_list(self) -> dict:              return self._inner.get_event_list()
     def get_wifi(self) -> dict:                    return self._inner.get_wifi()
     def get_danger_zone(self) -> dict:             return self._inner.get_danger_zone()
@@ -205,13 +213,15 @@ class PureSession:
         return self._pump('audio')
 
     def av_frames(self, duration=None) -> Iterator:
-        """Yield ('video'|'audio', bytes) access units as they arrive."""
+        """Yield ('video'|'audio', bytes) access units (pure-Python streaming).
+
+        Implemented in cuboai_pure.TUTKDirectSession (session-12 windowed-ACK fix).
+        """
         yield from self._inner.av_frames(duration=duration)
 
     def av_frames_timed(self, duration=None) -> Iterator:
-        """Yield (kind, bytes, frameinfo) — the parsed per-AU FRAMEINFO (carrying the
-        camera timestamp) travels with its AU for PTS assignment. frameinfo is None for
-        audio / unparsed AUs."""
+        """Yield (kind, bytes, frameinfo) — the parsed per-AU TUTK FRAMEINFO travels with its AU
+        (Part A), for PTS assignment. frameinfo is None for audio / unparsed AUs."""
         yield from self._inner.av_frames_timed(duration=duration)
 
     def video_frames_timed(self, duration=None, max_frames=None) -> Iterator:
@@ -227,8 +237,12 @@ class PureSession:
         yield from self._inner.video_frames(max_frames=max_frames)
 
     def snapshot(self, timeout_sec: float = 20.0) -> bytes:
-        """Capture one raw HEVC keyframe access unit (VPS+SPS+PPS+IDR, starting with
-        ``00000001 40``). Returns a complete HEVC keyframe in a few seconds; convert it
+        """Capture one raw HEVC keyframe access unit (VPS+SPS+PPS+IDR, starts
+        ``00000001 40``).
+
+        Implemented in cuboai_pure.TUTKDirectSession.snapshot. WORKS (session-12
+        windowed-ACK fix): returns a complete HEVC keyframe in a few seconds — NAL
+        layout VPS@0 SPS@28 PPS@77 IDR@88, header byte-identical to native. Convert
         to JPEG downstream with PyAV/ffmpeg if needed.
         """
         return self._inner.snapshot(timeout_sec=timeout_sec)

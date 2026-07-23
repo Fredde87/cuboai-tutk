@@ -23,7 +23,7 @@ from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# IOCTL type codes
+# IOCTL type codes (confirmed from decompiled AVIControlMSGType.java + live capture)
 # ---------------------------------------------------------------------------
 
 # Video/audio stream
@@ -134,8 +134,11 @@ def build_set_lullaby_play(song_uuid: str, correlation_id: int = 0) -> tuple[int
       offset 68: action = 0x01 (play)
       rest:      zeros
 
-    NOTE: the action byte is 0x01 = PLAY (switches the current song and sets
-    is_playing=1) and 0x00 = STOP.
+    NOTE (2026-05-30, re-verified live vs fw 3.0.1369): the action byte was
+    INVERTED in the earlier notes. 0x01 = PLAY (switches the current song and sets
+    is_playing=1), 0x00 = STOP. Proven on the live camera: sending 0x01 for
+    White Noise switched current_sound→White Noise and is_playing→True; 0x00 then
+    set is_playing→False. Corrected here so play/stop behave as named.
     """
     payload = bytearray(200)
     struct.pack_into('<I', payload, 0, correlation_id)
@@ -165,7 +168,9 @@ def build_get_lullaby_info() -> tuple[int, bytes]:
 
 @dataclass
 class HWControl:
-    """GET_HW_CONTROL response — 96 bytes (temp, humidity, night light, wifi, etc.)."""
+    """SMsgAVIoctrlGetHWControlResp — 96 bytes.
+    Confirmed live: temp=31.0°C, humidity=50.0%, night_light=1, fw=3.0.1369, ssid=MyWiFi
+    """
     id: int
     mic_level: int
     speaker_level: int
@@ -213,7 +218,7 @@ class HWControl:
 
 @dataclass
 class TempHumidity:
-    """GET_TEMP_HUMIDITY response — 20 bytes."""
+    """SMsgAVIoctrlGetTempHumidityResp — 20 bytes."""
     id: int
     result: int
     temperature: float   # °C
@@ -399,7 +404,7 @@ if __name__ == '__main__':
     print("Night light builder OK")
 
     tc, p = build_set_lullaby_stop('F55001F0-9D5A-4C09-B58C-896964CAE485')
-    assert p[68] == 0x00   # stop = 0x00
+    assert p[68] == 0x00   # stop = 0x00 (session-13 corrected builders)
     tc, p = build_set_lullaby_play('F55001F0-9D5A-4C09-B58C-896964CAE485')
     assert p[68] == 0x01   # play = 0x01
     print("Lullaby action builder OK")
@@ -679,9 +684,11 @@ def build_set_cry_detect(get_resp_bytes: bytes, *, enabled=None, sensitivity=Non
     echoed back unchanged; only the keyword fields you pass are modified.
 
     SET request wire layout (getSize()==40) — the SET struct shares the SAME field
-    offsets as the GET response (the `result` word @4 is present-but-zero). A value
-    written to @36 lands in the GET's cry_alert_sensitivity, and a value written to
-    @32 lands in cry_alert.
+    offsets as the GET response (the `result` word @4 is present-but-zero; toBytes
+    just doesn't populate it). PROVEN on the live camera: a value written to @36
+    lands in the GET's cry_alert_sensitivity, and a value written to @32 lands in
+    cry_alert. (The APK toBytes drops `result` from its write list, which misled an
+    earlier -4-shift guess; the wire offsets are identical to the GET.)
         @0  id (I)
         @4  result (I, =0)
         @8  audio_filter_enable (I)
@@ -712,11 +719,12 @@ def build_set_cough_setting(get_resp_bytes: bytes = None, *, enabled=None,
                             correlation_id: int = 0) -> tuple[int, bytes]:
     """SET_COUGH_SETTING_REQ (2454) — cough detection enable / mode / sensitivity.
 
-    SET wire layout (getSize()==16):
+    SET wire layout (APK SMsgAVIoctrlSetCoughSettingReq.toBytes, getSize()==16):
         @0 id (I)   @4 enable (I, = the coughAlert BITMASK)   @8 sensitivity (I)
         @12 reserved[4]
 
-    `coughAlert` (GET resp @8) is a BITMASK, not a bool:
+    `coughAlert` (GET resp @8) is a BITMASK, not a bool (APK isCoughAlertEnabled /
+    isCoughAIEnabled; switchCoughDetectionOption → setCoughAIEnabled(opt==1)):
         bit0 (&1) = cough alert enabled
         bit1 (&2) = "Only when baby is in crib" (cough-AI). Cleared = "Always Alert".
     So: 0=off, 1=on+Always Alert, 3=on+In-crib-only.
@@ -749,7 +757,7 @@ def build_set_cough_setting(get_resp_bytes: bytes = None, *, enabled=None,
 # cuboai_tutk.TUTKSession) so their decoded output is identical by construction.
 # Where the on-wire struct layout is confirmed (HW control, light style, lullaby)
 # the fields are exact; for the detection/status IOCTLs whose C struct we have not
-# yet fully decoded, the parser extracts the well-known leading fields (id @0, result @4)
+# yet reversed, the parser extracts the well-known leading fields (id @0, result @4)
 # plus the most likely flag/level words and ALSO returns 'raw_hex' so the true
 # layout stays inspectable. Tighten these as captures confirm offsets.
 
@@ -775,9 +783,9 @@ def _nonzero_words(raw: bytes) -> dict:
 
 
 def parse_hw_control(raw: bytes) -> dict:
-    """GET_HW_CONTROL_RESP (4385) — exact layout."""
+    """GET_HW_CONTROL_RESP (4385) — exact layout (SMsgAVIoctrlGetHWControlResp)."""
     hw = HWControl.parse(raw)
-    # night_vision_control @12 (0=auto, 1=on/IR, 2=off)
+    # night_vision_control @12 (0=auto, 1=on/IR, 2=off — APK SMsgAVIoctrlGetHWControlResp)
     nv = {0: 'auto', 1: 'on', 2: 'off'}.get(hw.night_vision_control,
                                             f'mode {hw.night_vision_control}')
     return {
@@ -798,18 +806,27 @@ def parse_hw_control(raw: bytes) -> dict:
 
 
 def parse_light_style(raw: bytes) -> dict:
-    """GET_LIGHT_STYLE_RESP (4367). brightness @24 confirmed (LightStyle dataclass)."""
+    """GET_LIGHT_STYLE_RESP (4367, 552B). Offsets VERIFIED live 2026-07-10 against the
+    APK SMsgAVIoctrlGetLightStyleResp + SMsgLIGHTSTYLE([B]) constructors:
+        id@0, result@4, status_light@8 (16B), night_light@24 (16B).
+    Each SMsgLIGHTSTYLE block is {brightness@+0, r@+4, g@+8, b@+12} (LE int32, 16B).
+    QUIRK: the APK's 'pattern_id' and 'r' are the SAME 4 bytes @+4 — aliased in BOTH
+    directions (toBytes writes pattern_id then overwrites it with r; the byte ctor reads
+    offset 4 into both fields). So there is NO separate animation/pattern field on the
+    wire; surfaced as r_or_pattern. brightness@24 = night_light brightness (the
+    long-proven LightStyle-dataclass value; corrects the earlier night_light@28 guess).
+    Live read on this camera returned night_light={brightness=3, r=g=b=0} while lit."""
     def _style(base):
-        if len(raw) < base + 20:
+        if len(raw) < base + 16:
             return None
-        return {'brightness': _i32(raw, base), 'pattern_id': _i32(raw, base + 4),
-                'r': _i32(raw, base + 8), 'g': _i32(raw, base + 12), 'b': _i32(raw, base + 16)}
+        return {'brightness': _i32(raw, base), 'r_or_pattern': _i32(raw, base + 4),
+                'r': _i32(raw, base + 4), 'g': _i32(raw, base + 8), 'b': _i32(raw, base + 12)}
     return {
-        'brightness':   _i32(raw, 24),
-        'style':        _i32(raw, 0),     # correlation/id word; refine vs capture
-        'warm_cool':    _i32(raw, 28),
-        'status_light': _style(8),        # UNVERIFIED offsets (APK SMsgLIGHTSTYLE)
-        'night_light':  _style(28),       # UNVERIFIED offsets
+        'brightness':   _i32(raw, 24),   # = night_light brightness (0-100)
+        'id':           _i32(raw, 0),
+        'result':       _i32(raw, 4),
+        'status_light': _style(8),
+        'night_light':  _style(24),
         'raw_len':      len(raw),
         'raw_hex':      raw[:64].hex(),
     }
@@ -817,8 +834,8 @@ def parse_light_style(raw: bytes) -> dict:
 
 def parse_sleep_safety(raw: bytes) -> dict:
     """GET_SLEEP_SAFETY_STATUS_RESP (2337) — live safe-sleep detection state.
-    Wire order: id, result, status@8, remaining_time@12, duration@16.
-    status 0 = no active detection / idle."""
+    APK SMsgAVIoctrlGetSleepSafetyStatusResp wire order: id, result, status@8,
+    remaining_time@12, duration@16. status 0 = no active detection / idle."""
     status = _i32(raw, 8)
     return {
         'status':         status,
@@ -848,7 +865,7 @@ def parse_sleep_mode(raw: bytes) -> dict:
 def _parse_detection(raw: bytes) -> dict:
     """Shared best-effort parser for the cry/cough detection-setting responses.
 
-    Exact struct not fully decoded. Empirically the config words sit AFTER a block of
+    Exact struct not yet reversed. Empirically the config words sit AFTER a block of
     zero/reserved leading words and BEFORE the 0x1a22 marker tail (live cry response:
     value 3 @0x20, value 2 @0x24; live cough response: all-zero -> feature inactive).
     We strip the marker tail, collect the non-zero words, and report the feature as
@@ -871,10 +888,12 @@ def _parse_detection(raw: bytes) -> dict:
     }
 
 
-# Sensitivity scale shared by cry + cough alerts. The int→label mapping is INVERTED:
-#   1 → High
-#   2 → Medium   (the firmware default)
-#   3 → Low
+# Sensitivity scale shared by cry + cough alerts. APK-CONFIRMED (S28) the int→label
+# mapping is INVERTED from the naive guess: getSensitivityText()/updateCryDetect() map
+#   1 → R.string.settings_sensitivity_state_high
+#   2 → R.string.settings_sensitivity_state_medium   (the firmware default)
+#   3 → R.string.settings_sensitivity_state_low
+# (resource IDs resolved 1=2132018619=high, 2=2132018623=medium, 3=2132018621=low).
 SENSITIVITY_LABELS = {1: 'High', 2: 'Medium', 3: 'Low'}
 
 def sensitivity_label(v) -> str:
@@ -884,19 +903,20 @@ def sensitivity_label(v) -> str:
 
 def parse_cry_detection(raw: bytes) -> dict:
     """GET_CRY_DETECT_RESP (2325) — cry detection enabled + sensitivity.
-    Layout:
+    Exact layout from APK SMsgAVIoctrlGetCryDetectResp.<init> write order:
       id@0, result@4, audio_filter_enable@8, audio_filter_bypass_energy_level@12,
       cry_criteria_hit_percentage@16 (double,8), cry_criteria_dnn_confidence@24
       (double,8), cry_alert@32, cry_alert_sensitivity@36, model_version@40.
 
-    `cry_alert`@32 is a BITMASK:
+    `cry_alert`@32 is a BITMASK (S28, APK isCryAlertEnabled/isCryAIEnabled):
       bit0 (&1) = cry-alert enabled, bit1 (&2) = cry-AI mode enabled.
     `sensitivity` is cry_alert_sensitivity@36 (=0x24); 1=High, 2=Medium, 3=Low."""
     import struct as _s
     cry_alert = _u32(raw, 32) if len(raw) >= 36 else None
     sens      = _u32(raw, 36) if len(raw) >= 40 else None
-    # hit_percentage@16 + dnn_confidence@24 are little-endian doubles (the model's firing
-    # thresholds); bypass_energy_level@12 is the audio noise-filter threshold.
+    # hit_percentage@16 + dnn_confidence@24 are little-endian doubles (8 B each) — the model's
+    # firing thresholds (APK SMsgAVIoctrlGetCryDetectResp). bypass_energy_level@12 is the audio
+    # noise-filter threshold. These are the deep tuning knobs the app exposes.
     hitpct = _s.unpack_from('<d', raw, 16)[0] if len(raw) >= 24 else None
     dnnconf = _s.unpack_from('<d', raw, 24)[0] if len(raw) >= 32 else None
     return {
@@ -919,14 +939,14 @@ def parse_cry_detection(raw: bytes) -> dict:
 
 def parse_cough_detection(raw: bytes) -> dict:
     """GET_COUGH_SETTING_RESP (2453) — cough detection enabled + mode + sensitivity.
-    Layout:
+    Exact layout from APK SMsgAVIoctrlGetCoughSettingResp.<init>:
       id@0, result@4, coughAlert@8, coughAlertSensitivity@12.
 
-    `coughAlert`@8 is a BITMASK: bit0 (&1)=enabled, bit1 (&2)=AI mode =
-    "Only when baby is in crib" (cleared = "Always Alert"). A `coughAlertSensitivity`@12
-    field is declared but on this firmware that slot is overwritten by the camera's
-    0x1a22 marker tail (the response is only id/result/coughAlert + marker), so
-    sensitivity is reported only when @12 reads as a sane 1-3 (else None)."""
+    `coughAlert`@8 is a BITMASK (S28): bit0 (&1)=enabled, bit1 (&2)=AI mode =
+    "Only when baby is in crib" (cleared = "Always Alert"). The APK declares a
+    `coughAlertSensitivity`@12 but on fw 3.0.1369 that slot is overwritten by the
+    camera's 0x1a22 marker tail (the live resp is only id/result/coughAlert + marker),
+    so sensitivity is reported only when @12 reads as a sane 1-3 (else None)."""
     mask = _u32(raw, 8) if len(raw) >= 12 else None
     sens = _u32(raw, 12) if len(raw) >= 16 else None
     if sens is None or not (1 <= sens <= 3):   # marker tail / not present on this fw
@@ -1027,11 +1047,13 @@ def parse_lullaby(raw: bytes) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Additional GET builders / parsers. Each responds using an 8-byte zero request
-# payload (the canonical request size — a 4-byte payload yields false negatives).
-# All are GET requests by construction; no SET code is sent. Where the C struct is
-# not fully known the parser extracts the well-known leading fields and ALSO returns
-# raw_hex so the layout stays inspectable, matching the convention of the parsers above.
+# NEW GET builders / parsers (session 2026-05-31). Every code below was confirmed
+# to RESPOND on the live camera (fw 3.0.1369) using an 8-byte zero request payload
+# (the canonical request size — a 4-byte payload yields false negatives). All are
+# GET requests by construction (cross-checked against the APK IOTYPE name table);
+# NO SET code is sent. Where the C struct is not fully reversed the parser extracts
+# the well-known leading fields and ALSO returns raw_hex so the layout stays
+# inspectable, matching the convention of the parsers above.
 # ---------------------------------------------------------------------------
 
 def _f32(raw: bytes, off: int):
@@ -1065,7 +1087,7 @@ def build_get_detection_zone_v2() -> tuple[int, bytes]:
 
 def parse_temp_humidity(raw: bytes) -> dict:
     """GET_TEMP_HUMIDITY_RESP (4373) — dedicated temp/humidity.
-    Example: temp@8 reliable (28.0 C, matches hw_control); the humidity slot @12 is
+    Live: temp@8 reliable (28.0 C, matches hw_control); the humidity slot @12 is
     overwritten by the camera's 0x1a22-style marker tail on this firmware, so it is
     reported only when it reads as a sane 0-100% (else None — use get_hw_control for
     humidity)."""
@@ -1111,7 +1133,7 @@ def parse_status_light(raw: bytes) -> dict:
 
 def parse_hw_policy(raw: bytes) -> dict:
     """GET_HW_POLICY_RESP (4379) — temperature/humidity comfort-alert thresholds.
-    Wire order:
+    APK SMsgAVIoctrlGetHWPolicyResp wire order (from <init>):
       id, result, temp_alert@8, temp_low@12, temp_high@16, humi_alert@20,
       humi_low@24, humi_high@28, dev_pull_alert@32, dev_pull_sens@36, dev_pull_count@40.
     (The firmware sends temp thresholds as plain integer °C even though the app field
@@ -1135,12 +1157,13 @@ def parse_hw_policy(raw: bytes) -> dict:
 
 def parse_sleep_safety_setting(raw: bytes) -> dict:
     """GET_SLEEP_SAFETY_SETTING_RESP (2331) — safe-sleep alert toggles.
-    Wire order:
+    APK SMsgAVIoctrlGetSleepSafetySettingResp wire order (from <init>):
       id, result, safety_alert@8, cover_alert@12, safety_detection_sensitivity@16,
-      baby_presence_alert@20.
+      baby_presence_alert@20.  (The previous @12/@20 mapping was wrong.)
+    Live: safety_alert=0 (OFF), cover_alert=1 (ON), baby_presence_alert=1 (ON).
 
     `safety_alert` and `cover_alert` are a MUTUALLY-EXCLUSIVE radio, NOT independent
-    toggles:
+    toggles (S28, APK switchSleepSafetyDetectionType):
       safety_alert=1, cover_alert=0 → "Covered Face and Rollover Alerts" (full)
       safety_alert=0, cover_alert=1 → "Covered Face Alerts Only"
       both 0                        → sleep-safety detection OFF
@@ -1190,7 +1213,7 @@ def parse_auto_capture(raw: bytes) -> dict:
 
 def parse_smart_temp_config(raw: bytes) -> dict:
     """GET_SMART_TEMP_CONFIG_RESP (4881) — wearable thermometer alert thresholds.
-    Example: enabled@8=1, high_temp f32@0x0c=37.2 C, low_temp f32@0x14=34.7 C."""
+    Live: enabled@8=1, high_temp f32@0x0c=37.2 C, low_temp f32@0x14=34.7 C."""
     return {
         'enabled':       bool(_u32(raw, 8)) if len(raw) >= 12 else None,
         'high_temp_c':   round(_f32(raw, 12), 1) if len(raw) >= 16 else None,
@@ -1222,7 +1245,7 @@ def parse_lullaby_schedule(raw: bytes) -> dict:
 
 def parse_light_way_config(raw: bytes) -> dict:
     """GET_LIGHT_WAY_CONFIG_RESP (2407) — sunrise/sunset ambient-light config.
-    Struct not fully decoded; live carries leading config words (@8=5, @0x0c=1) and the
+    Struct not reversed; live carries leading config words (@8=5, @0x0c=1) and the
     device SSID string. Expose leading words + any ASCII tokens + raw."""
     asc = ''.join(chr(b) if 32 <= b < 127 else ' ' for b in raw[:128])
     tokens = [t for t in asc.split() if len(t) >= 4]
@@ -1238,9 +1261,9 @@ def parse_light_way_config(raw: bytes) -> dict:
 
 def parse_detection_zone_v2(raw: bytes) -> dict:
     """GET_DETECTION_ZONE_V2_RESP (2381) — normalized detection bounding box.
-    Wire order:
+    APK SMsgAVIoctrlGetDetectionZoneV2Resp wire order (from <init>):
       id, result, x_max@8, y_max@12, x_min@16, y_min@20, measurement@24.
-    It is a (x_min,y_min)-(x_max,y_max) box in [0,1], NOT x/y/w/h. Example:
+    It is a (x_min,y_min)-(x_max,y_max) box in [0,1], NOT x/y/w/h. Live:
     x∈[0.22,0.70], y∈[0.37,0.89]. A degenerate/zero box = whole frame (not set)."""
     if len(raw) < 24:
         return {'configured': False, 'id': _u32(raw, 0), 'raw_len': len(raw)}
@@ -1262,13 +1285,14 @@ def parse_detection_zone_v2(raw: bytes) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Further batch of GET codes — each responds (8-byte zero request, the response
-# io_type == req+1 with non-zero payload). The many GET codes that DON'T respond on
-# this baby-monitor firmware (mic/speaker volume, wifi-AP list, videomode, streamctrl,
-# motiondetect, environment, devinfo, capacity, system, osd, timezone, event/status
-# index, lullaby_info, license_mode, BBcall, …) are intentionally NOT wired. Where a
-# struct isn't fully known the parser exposes the leading id/result words plus raw_hex,
-# matching the convention above.
+# Second 2026-05-31 batch — codes extracted from the APK DEX <clinit> (dexlib2)
+# and each LIVE-confirmed to respond on fw 3.0.1369 (8-byte zero request, the
+# response io_type == req+1 with non-zero payload). The many APK GET codes that
+# DON'T respond on this baby-monitor firmware (mic/speaker volume, wifi-AP list,
+# videomode, streamctrl, motiondetect, environment, devinfo, capacity, system,
+# osd, timezone, event/status index, lullaby_info, license_mode, BBcall, …) are
+# intentionally NOT wired. Where a struct isn't fully reversed the parser exposes
+# the leading id/result words plus raw_hex, matching the convention above.
 # ---------------------------------------------------------------------------
 IOTYPE_USER_IPCAM_LISTEVENT_REQ                 = 0x0318  # 792
 IOTYPE_USER_IPCAM_LISTEVENT_RESP                = 0x0319  # 793
@@ -1316,8 +1340,10 @@ def build_get_mat_info():               return _get8(IOTYPE_USER_IPCAM_GET_MAT_I
 def build_get_smart_temp_info():        return _get8(IOTYPE_USER_IPCAM_GET_SMART_TEMP_INFO_REQ)
 def build_get_feature_support():        return _get8(IOTYPE_USER_IPCAM_FEATURE_SUPPORT_REQ)
 
-# ── Undocumented query endpoints — not referenced by the native SDK or app, yet the
-#    camera answers them. REQ codes are even, RESP == REQ|1, payload = _get8. ──
+# ── UNDOCUMENTED query endpoints (discovered 2026-06-09 by live code-space probing;
+#    NOT referenced anywhere in the native SDK or the Android app, yet the camera answers
+#    them on fw 3.0.1369. REQ codes are even, RESP == REQ|1, payload = _get8.
+#    See CAMERA_CAPABILITY_PROBE.md for the discovery + the full undocumented-code list. ──
 IOTYPE_USER_GET_SESSION_STATS_REQ  = 0x0934   # 2356 — live per-session stream stats (JSON)
 IOTYPE_USER_GET_SESSION_STATS_RESP = 0x0935   # 2357
 IOTYPE_USER_GET_USER_LIST_REQ      = 0x0946   # 2374 — connected-users list (JSON)
@@ -1347,8 +1373,8 @@ def _blob_common(raw: bytes, hexlen: int = 64) -> dict:
 
 def parse_event_list(raw: bytes) -> dict:
     """LISTEVENT_RESP (793) — recent event-log header. The word@8 packs the TUTK
-    list-event header bytes [channel, endflag, count, reserved]; the count byte
-    (offset 10) is the number of event entries that follow."""
+    SMsgAVIoctrlListEventResp header bytes [channel, endflag, count, reserved]; the
+    count byte (offset 10) is the number of event entries that follow. Live: count=3."""
     count = raw[10] if len(raw) >= 11 else None
     return {
         'count':   count,
@@ -1361,7 +1387,7 @@ def parse_event_list(raw: bytes) -> dict:
 
 def parse_wifi(raw: bytes) -> dict:
     """GET_WIFI_RESP (2319) — current Wi-Fi association. Carries the SSID (@8), the
-    camera's LAN IP, and the camera's MAC as null-terminated ASCII tokens. Example:
+    camera's LAN IP, and the camera's MAC as null-terminated ASCII tokens. Live:
     ssid 'MyWiFi', ip '192.0.2.10', mac 'aa:bb:cc:dd:ee:ff'."""
     import re
     toks = _ascii_tokens(raw, minlen=2, limit=20)
@@ -1377,10 +1403,11 @@ def parse_wifi(raw: bytes) -> dict:
         'raw_len': len(raw),
         'raw_hex': raw[:24].hex(),
     }
-    # Connected-AP radio metrics — exact offsets from the SMsgAVIoctrlGetYunWifiResp([B) parser
-    # (signed LE int32): channelNum@0x94, frequency@0x98 (MHz), quality@0x9c, strength@0xa0 (RSSI;
-    # dBm if negative), noise@0xa4. May read 0 if the firmware doesn't populate them; the primary
-    # signal metric remains get_hw_control.wifi_strength (0–100 %).
+    # Connected-AP radio metrics — exact offsets from the APK SMsgAVIoctrlGetYunWifiResp([B)
+    # constructor (signed LE int32): channelNum@0x94, frequency@0x98 (MHz), quality@0x9c,
+    # strength@0xa0 (RSSI; dBm if negative), noise@0xa4 (noise floor). These may read 0 if this
+    # firmware doesn't populate them (confirm with a live read); the camera's primary signal
+    # metric is still get_hw_control.wifi_strength (0–100 %).
     if len(raw) >= 0xa8:
         out['channel']   = _i32(raw, 0x94)
         out['frequency'] = _i32(raw, 0x98)
@@ -1392,14 +1419,14 @@ def parse_wifi(raw: bytes) -> dict:
 def parse_danger_zone(raw: bytes) -> dict:
     """GET_DANGERZONE_RESP (2313) / GET_DANGERZONE2_RESP (4613) — danger-zone config.
 
-    Wire layout: id@0, dzone_config@4, result@(end-8), reserved@(end-4).
+    Wire layout (APK, S28): id@0, dzone_config@4, result@(end-8), reserved@(end-4).
     dzone_config = 2 × roi (v1 roi=500 B, v2 roi=200 B). Each roi starts with
     enable@0 (int) then type@4 then name@8 (64 B ASCII). So in the full buffer
     roi[0].enable is @4 and roi[0].name is @12 for BOTH v1 and v2. A configured zone
     has enable!=0 and a real ASCII name; an unset zone is all-zero or carries the
     placeholder tag '##dzone_name_default_tag##'."""
     enable = _u32(raw, 4)
-    # roi[0].name is a 64-byte NUL-terminated ASCII field at @12.
+    # roi[0].name is a 64-byte NUL-terminated ASCII field at @12 (S28).
     name = None
     if len(raw) >= 12 + 64:
         nm = raw[12:12 + 64].split(b'\x00', 1)[0]
@@ -1425,7 +1452,7 @@ def parse_danger_zone(raw: bytes) -> dict:
     }
 
 
-# Danger-zone SET IOTYPE codes: GET 2312/2313, SET 2314/2315;
+# Danger-zone SET IOTYPE codes (APK AVIControlMSGType): GET 2312/2313, SET 2314/2315;
 # v2 GET 4612/4613, SET 4614/4615.
 IOTYPE_USER_IPCAM_SET_DANGERZONE_REQ   = 2314
 IOTYPE_USER_IPCAM_SET_DANGERZONE_RESP  = 2315
@@ -1444,11 +1471,12 @@ def build_set_danger_zone(get_resp_bytes: bytes, *, enable=None, name=None,
     """SET_DANGERZONE_REQ (2314, v1) / SET_DANGERZONE2_REQ (4614, v2) — byte-faithful
     read-modify-write of the danger-zone config.
 
-    The GET response and the SET request share the SAME wire layout:
+    The GET response and the SET request share the SAME wire layout (S28):
         id@0, dzone_config@4 (2 × roi), result@(end-8), reserved@(end-4).
-    The enable/disable switch is exactly this RMW: GET the zone, flip
-    roi[`roi_index`].enable, and send the whole buffer back. We echo `get_resp_bytes`
-    unchanged and modify only what you pass:
+    The app's enable/disable switch is exactly this RMW: GET the zone, flip
+    roi[`roi_index`].enable, and send the whole buffer back (SubSettingDangerZone
+    onSwitchDangerZoneAlert$lambda$11). We echo `get_resp_bytes` unchanged and modify
+    only what you pass:
         enable : 0/1 → roi.enable (int @ roi_base+0)
         name   : ASCII, written into roi.name (64 B @ roi_base+8, NUL-padded)
         points : iterable of 8 ints [x1,y1,x2,y2,x3,y3,x4,y4] → roi.points
@@ -1486,7 +1514,7 @@ def build_set_danger_zone(get_resp_bytes: bytes, *, enable=None, name=None,
 
 def parse_detection_zone(raw: bytes) -> dict:
     """GET_DETECTION_ZONE_RESP (2353) — legacy v1 grid motion-detection zone.
-    Example: word@4=0xffffffff, body all-zero = no v1 grid set (whole frame). The active
+    Live: word@4=0xffffffff, body all-zero = no v1 grid set (whole frame). The active
     zone is reported by the v2 normalized box (parse_detection_zone_v2)."""
     body = [_u32(raw, o) for o in range(8, min(len(raw), 28), 4)]
     return {
@@ -1499,13 +1527,13 @@ def parse_detection_zone(raw: bytes) -> dict:
 
 # TUTK AV media codec ids (AVFRAMEINFO.codec_id)
 _VIDEO_CODECS = {0x4E: 'H.264', 0x50: 'HEVC (H.265)', 0x4F: 'MJPEG'}
-# CuboAI Gen3 device video profiles:
+# CuboAI Gen3 device video profiles (cloud.yunyun.cubo...Gen3DeviceVideoProfile):
 #   hd = fps 30, 1_200_000 bps, codec 0x50, 2560x1440 ; sd = 15, 800_000, ...
 _GEN3_BITRATE_KBPS = {(2560, 1440, 30): 1200, (2560, 1440, 15): 800}
 
 def parse_media_profiles(raw: bytes) -> dict:
     """GET_MEDIAPROFILES_RESP (2377) — encoder/stream profile (1000 B).
-    Layout:
+    Layout (confirmed vs APK Gen3DeviceVideoProfile + live):
       codec_id@12 (0x50 = HEVC — NOT a bitrate), width@16, height@20, fps@24,
       gop@28, profile_count@36.  The per-profile bitrate is not in this header; the
       camera's HD profile target is 1.2 Mbps (Gen3 device profile)."""
@@ -1531,7 +1559,7 @@ def parse_media_profiles(raw: bytes) -> dict:
 def parse_lightweight_status(raw: bytes) -> dict:
     """GET_LIGHTWEIGHT_STATUS_RESP (2405) — compact combined status echo. Carries the
     current lullaby UUID (@12), temperature (f32 @88), humidity (f32 @92) and the
-    firmware string. Example: Brown Noise, 26.0°C, 45.0%, fw 3.0.1369."""
+    firmware string. Live: Brown Noise, 26.0°C, 45.0%, fw 3.0.1369."""
     uuid = raw[12:48].split(b'\x00', 1)[0].decode('ascii', 'replace') if len(raw) >= 48 else ''
     temp  = _f32(raw, 88)
     humid = _f32(raw, 92)
@@ -1549,8 +1577,11 @@ def parse_lightweight_status(raw: bytes) -> dict:
     }
 
 def parse_lullaby_schedules(raw: bytes) -> dict:
-    """GET_LULLABY_SCHEDULES_RESP (2447) — lullaby timer schedule table (1008 B).
-    Per-entry struct not fully decoded -> expose header word + raw."""
+    """GET_LULLABY_SCHEDULES_RESP (2447) — lullaby schedule table (1008 B). DECODED (offsets
+    confirmed live against a known schedule). Header id@0/result@4; entries at stride 100 from @8:
+      enable@+0(int), name@+4(40B ASCII), uuid@+44(44B ASCII), nMDay@+88(byte day-bitmask),
+      nStartHour@+89, nStartMinute@+90, nAi@+91(AI auto-play), duration@+92(int SECONDS),
+      created@+96(int unix-ts). Returns the enabled entries in 'schedules'."""
     d = _blob_common(raw)
     scheds = []
     base = 8
@@ -1577,8 +1608,8 @@ def parse_lullaby_schedules(raw: bytes) -> dict:
 
 def parse_lullaby_schedule_action(raw: bytes) -> dict:
     """GET_LULLABY_SCHEDULE_ACTION_RESP (2451) — active + upcoming scheduled lullaby
-    (two schedule blocks, each {enable, name, ...}). The body is all-zero when no
-    lullaby schedule is configured (enable=0)."""
+    (two SMsgLullabySchedule blocks, each {enable, name, ...}). The body is all-zero
+    when no lullaby schedule is configured (enable=0). Live: none configured."""
     body = _trim_marker(raw)[8:]
     return {
         'has_schedule': any(body),
@@ -1603,15 +1634,15 @@ def parse_mat_config(raw: bytes) -> dict:
         'raw_hex':     raw[:40].hex(),
     }
 
-# Breathing-mat MAT_STATE_* + MAT_DETECT_STATE_* enums
+# APK SMsgAVIoctrlGetMatInfoResp MAT_STATE_* + MAT_DETECT_STATE_* enums
 _MAT_STATE = {0: 'none', 1: 'looking', 2: 'ready'}
 _MAT_DETECT = {0: 'init', 1: 'measuring', 2: 'movement', 3: 'breathing', 4: 'no movement'}
 
 def parse_mat_info(raw: bytes) -> dict:
     """GET_MAT_INFO_RESP (4869) — breathing-mat live state.
-    Wire order: id, result, state@8, battery@12, irssi@16, detect_state@20, bpm@24,
-    ai_mode@28, baby_state@32, ...
-    state 0 (MAT_STATE_NONE) = no mat connected."""
+    APK SMsgAVIoctrlGetMatInfoResp wire order: id, result, state@8, battery@12,
+    irssi@16, detect_state@20, bpm@24, ai_mode@28, baby_state@32, ...
+    state 0 (MAT_STATE_NONE) = no mat connected. Live: state=0 → not connected."""
     state = _u32(raw, 8) or 0
     connected = state != 0
     return {
@@ -1628,9 +1659,10 @@ def parse_mat_info(raw: bytes) -> dict:
 
 def parse_smart_temp_info(raw: bytes) -> dict:
     """GET_SMART_TEMP_INFO_RESP (4877) — wearable-thermometer live reading.
-    Wire order: id, result, smartTempInfo scan block, status, batteryLevel.
-    batteryLevel reads 0xFFFFFFFF (-1) and the scan block is all-zero when no probe
-    is paired. A paired probe reports a body temp f32 (~30-43°C) and a 0-100 battery."""
+    APK SMsgAVIoctrlGetSmartTempInfoResp: id, result, smartTempInfo scan block,
+    status, batteryLevel. batteryLevel reads 0xFFFFFFFF (-1) and the scan block is
+    all-zero when no probe is paired. A paired probe reports a body temp f32 (~30-43°C)
+    and a 0-100 battery. Live: not paired."""
     battery = _u32(raw, 72)
     # scan for any plausible body-temperature float in the scan block
     temp = None
@@ -1652,7 +1684,7 @@ def parse_smart_temp_info(raw: bytes) -> dict:
 def parse_feature_support(raw: bytes) -> dict:
     """FEATURE_SUPPORT_RESP (4887) — per-feature capability map (988 B). Live leading
     words [1,1,2,0,2,...] are per-feature support flags; exact feature ordering not
-    not fully decoded -> expose the flag vector + raw for inspection."""
+    reversed -> expose the flag vector + raw for inspection."""
     d = _blob_common(raw)
     d['flags'] = [_u32(raw, o) for o in range(8, min(len(raw), 88), 4)]
     return d
@@ -1676,7 +1708,7 @@ def parse_session_stats(raw: bytes) -> dict:
     """GET_SESSION_STATS_RESP (0x0935) — UNDOCUMENTED. The camera's own per-session
     telemetry as embedded JSON: connection mode (lan/relay), NAT, client IP, and per-
     stream video/audio counters (frm_count, key_frm_count, resendBufferUsage,
-    send_err_count, v_err code ring). Example: the audio frm_count advances ~15.7/s during a
+    send_err_count, v_err code ring). Live: the audio frm_count advances ~15.7/s during a
     stream — a camera-side health channel to cross-check our own loss/recovery accounting
     (resendBufferUsage is the camera's resend-FIFO pressure). NOTE: video frm_count read 0
     in early probes (likely a session_id indexing quirk) — verify when extending."""
@@ -1718,7 +1750,7 @@ GET_METHODS = {
     'get_cough_detection':   (build_get_cough_setting,      IOTYPE_USER_GET_COUGH_SETTING_RESP,     parse_cough_detection),
     'check_firmware_update': (build_check_firmware_update,  IOTYPE_USER_GET_UPDATE_INFO_RESP,       parse_firmware_update),
     'get_connected_users':   (build_get_connected_users,    IOTYPE_USER_GET_CONNECTED_USER_RESP,    parse_connected_users),
-    # --- additional GET controls ---
+    # --- new (2026-05-31), all confirmed responding on fw 3.0.1369 ---
     'get_temp_humidity':       (build_get_temp_humidity,      IOTYPE_USER_GET_TEMP_HUMIDITY_RESP,       parse_temp_humidity),
     'get_night_light':         (build_get_night_light,        IOTYPE_USER_GET_NIGHT_LIGHT_ON_OFF_RESP,  parse_night_light),
     'get_status_light':        (build_get_status_light,       IOTYPE_USER_GET_STATUS_LIGHT_ON_OFF_RESP, parse_status_light),
@@ -1729,9 +1761,10 @@ GET_METHODS = {
     'get_lullaby_schedule':    (build_get_lullaby_schedule,   IOTYPE_USER_GET_LULLABY_SCHEDULE_RESP,    parse_lullaby_schedule),
     'get_light_way_config':    (build_get_light_way_config,   IOTYPE_USER_GET_LIGHT_WAY_CONFIG_RESP,    parse_light_way_config),
     'get_detection_zone_v2':   (build_get_detection_zone_v2,  IOTYPE_USER_GET_DETECTION_ZONE_V2_RESP,   parse_detection_zone_v2),
-    # --- further GET controls (codes that don't respond on this firmware — timezone,
-    #     event/status index, lullaby_info, mic/speaker volume, wifi-list, videomode,
-    #     environment, devinfo, … — are deliberately NOT wired). ---
+    # --- second 2026-05-31 batch (APK-DEX-extracted, each LIVE-confirmed to
+    #     respond on fw 3.0.1369 with rt==req+1; codes that timed out — timezone,
+    #     event/status index, lullaby_info, mic/speaker volume, wifi-list,
+    #     videomode, environment, devinfo, … — are deliberately NOT wired). ---
     'get_event_list':            (build_get_event_list,            IOTYPE_USER_IPCAM_LISTEVENT_RESP,                parse_event_list),
     'get_wifi':                  (build_get_wifi,                  IOTYPE_USER_IPCAM_GET_WIFI_RESP,                 parse_wifi),
     'get_danger_zone':           (build_get_danger_zone,           IOTYPE_USER_IPCAM_GET_DANGERZONE_RESP,           parse_danger_zone),
@@ -1745,17 +1778,18 @@ GET_METHODS = {
     'get_mat_info':              (build_get_mat_info,              IOTYPE_USER_IPCAM_GET_MAT_INFO_RESP,             parse_mat_info),
     'get_smart_temp_info':       (build_get_smart_temp_info,       IOTYPE_USER_IPCAM_GET_SMART_TEMP_INFO_RESP,      parse_smart_temp_info),
     'get_feature_support':       (build_get_feature_support,       IOTYPE_USER_IPCAM_FEATURE_SUPPORT_RESP,          parse_feature_support),
-    # --- undocumented endpoints (not referenced by the native SDK/app, but the
-    #     camera answers them). ---
+    # --- UNDOCUMENTED endpoints (discovered 2026-06-09, live-confirmed fw 3.0.1369;
+    #     not referenced by the native SDK/app). See CAMERA_CAPABILITY_PROBE.md. ---
     'get_session_stats':         (build_get_session_stats,         IOTYPE_USER_GET_SESSION_STATS_RESP,              parse_session_stats),
     'get_user_list':             (build_get_user_list,             IOTYPE_USER_GET_USER_LIST_RESP,                  parse_user_list),
 }
 
 
 # ===========================================================================
-# SET builders.  Every request wire layout below follows the request field WRITE
-# ORDER (the serialiser order, which differs from an alphabetical field listing).
-# Where the SET struct differs from the GET response
+# NEW SET builders (2026-05-31).  Every request wire layout below was confirmed
+# from the APK by dumping the SMsgAVIoctrlSet*Req.toBytes() field WRITE ORDER
+# (dexlib2; the alphabetical instance-field listing is NOT the wire order — the
+# serialiser order is).  Where the SET struct differs from the GET response
 # struct (it usually does — e.g. HW_CONTROL, HW_POLICY, DETECTION_ZONE_V2 all
 # reorder fields and drop the device-only fields), the builders take the RAW
 # GET response bytes and do a byte-faithful read-modify-write: every field the
@@ -1806,7 +1840,7 @@ def build_set_hw_control(get_resp_bytes: bytes, *,
     ioctl(*build_get_hw_control())). Every current value is echoed back unchanged;
     only the keyword fields you pass are modified.
 
-    SET request wire layout —
+    SET request wire layout — confirmed from APK SMsgAVIoctrlSetHWControlReq.toBytes,
     and it DIFFERS from the GET response layout (GET has extra device-only fields):
         @0  id (I)                    @40 temperature (F, echoed raw)
         @4  result (I, =0)            @44 humidity (F, echoed raw)
@@ -1819,7 +1853,7 @@ def build_set_hw_control(get_resp_bytes: bytes, *,
         @32 camera_angle (I)
         @36 stand_type (I)
 
-    night_vision_mode: 0=auto, 1=on (IR forced), 2=off.
+    night_vision_mode: 0=auto, 1=on (IR forced), 2=off (APK enum).
     """
     hw = HWControl.parse(get_resp_bytes)
     payload = bytearray(96)
@@ -1844,7 +1878,7 @@ def build_set_hw_control(get_resp_bytes: bytes, *,
 
 def build_set_status_light(on: bool, correlation_id: int = 0) -> tuple[int, bytes]:
     """SET_STATUS_LIGHT_ON_OFF_REQ (4364) — camera-body LED indicator on/off.
-    Wire layout: id(4) + on_off(4) + reserved(4). Mirrors the
+    Wire layout (APK toBytes): id(4) + on_off(4) + reserved(4). Mirrors the
     confirmed SET_NIGHT_LIGHT layout (on_off @4, not @8 as in the GET response)."""
     return IOTYPE_USER_SET_STATUS_LIGHT_ON_OFF_REQ, struct.pack('<III',
                                                                 correlation_id,
@@ -1854,7 +1888,7 @@ def build_set_status_light(on: bool, correlation_id: int = 0) -> tuple[int, byte
 def build_set_sleep_safety(safety_alert, cover_alert, sensitivity,
                            baby_presence_alert, correlation_id: int = 0) -> tuple[int, bytes]:
     """SET_SLEEP_SAFETY_SETTING_REQ (2332) — safe-sleep alert toggles.
-    Wire layout (5 ints, no
+    Wire layout (APK SMsgAVIoctrlSetSleepSafetySettingReq.toBytes, 5 ints, no
     reserved): id, safety_alert, cover_alert, safety_detection_sensitivity,
     baby_presence_alert."""
     return IOTYPE_USER_SET_SLEEP_SAFETY_SETTING_REQ, struct.pack(
@@ -1869,7 +1903,7 @@ def build_set_detection_zone_v2(get_resp_bytes: bytes, *,
     Read-modify-write from the raw GET_DETECTION_ZONE_V2 response.
 
     GET resp layout: id@0, result@4, x_max@8, y_max@12, x_min@16, y_min@20, meas@24.
-    SET req layout: id@0, x_max@4, y_max@8, x_min@12, y_min@16,
+    SET req  layout (APK toBytes): id@0, x_max@4, y_max@8, x_min@12, y_min@16,
                                    measurement@20, reserved[60].
     Coordinates are floats in [0,1]. Unchanged coords are echoed byte-for-byte."""
     payload = bytearray(84)
@@ -1899,11 +1933,11 @@ def build_set_hw_policy(get_resp_bytes: bytes, *,
     GET resp layout: id@0, result@4, temp_alert@8, temp_low@12, temp_high@16,
         humi_alert@20, humi_low@24, humi_high@28, dev_pull_alert@32,
         dev_pull_sens@36, dev_pull_count@40.
-    SET req layout: id@0, temp_alert@4, temp_low@8, temp_high@12,
+    SET req layout (APK toBytes): id@0, temp_alert@4, temp_low@8, temp_high@12,
         humi_alert@16, humi_low@20, humi_high@24, dev_pull_alert@28,
         dev_pull_sens@32, dev_pull_count@36, version(byte)@40, reserved.
 
-    The protocol carries temp thresholds as float, but the camera's GET response
+    The APK declares temp thresholds as float, but the camera's GET response
     carries them as plain integers (live: 19/24 °C). We byte-faithfully echo the
     camera's own 9 config words so a same-value SET is a genuine no-op, and apply
     overrides as integers to match the observed wire encoding."""
@@ -1922,7 +1956,7 @@ def build_set_hw_policy(get_resp_bytes: bytes, *,
 
 def build_set_auto_capture(mode: int, correlation_id: int = 0) -> tuple[int, bytes]:
     """SET_AUTO_CAPTURE_REQ (2366) — auto event-snapshot mode.
-    Wire layout (size 8):
+    Wire layout (APK SMsgAVIoctrlSetAutoSnapshotSettingReq.toBytes, getSize()==8):
         @0 id (I)   @4 enable (I)
     `enable` is the same int the GET response reports @8 — a bitmask, NOT a bare
     bool (bit0=motion-triggered, bit1=scheduled; live=3 → motion+schedule). Pass the
@@ -1941,7 +1975,7 @@ def build_set_lullaby_schedule(volume=None, duration=None, get_resp_bytes: bytes
     read-modify-write over the schedule echo: pass `get_resp_bytes` = the raw
     GET_LULLABY_SCHEDULE response so an omitted field is preserved.
 
-    SetLullabyVolDuration layout (size 140): id@0, duration@4, volume@8,
+    SetLullabyVolDuration.toBytes (getSize()==140): id@0, duration@4, volume@8,
     reserved[128]@12."""
     cur_timer, cur_vol = 0, 0
     if get_resp_bytes is not None and len(get_resp_bytes) >= 16:
