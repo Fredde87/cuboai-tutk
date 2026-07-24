@@ -980,6 +980,16 @@ def _unwrap_index(idx_u16, done_upto):
     return done_upto + ((idx_u16 - done_upto) & 0xFFFF)
 
 
+def _unwrap_index_back(idx_u16, cur):
+    """Lift a u16 wire counter BACKWARD into `cur`'s unbounded monotonic space: the nearest value
+    at-or-below `cur` congruent to idx_u16 (mod 65536). The mirror of `_unwrap_index`, for wire
+    values that always refer to something ALREADY SENT (a resend request naming one of our own
+    recent frames). While `cur` < 65536 this is the identity, so the wire is unchanged below the
+    wrap; past it the lookup keeps resolving instead of silently missing.
+    """
+    return cur - ((cur - idx_u16) & 0xFFFF)
+
+
 def is_keepalive_probe(raw: bytes) -> bool:
     """True iff `raw` is the camera's 24-byte IOTC keepalive (alive-check) probe.
 
@@ -1983,7 +1993,25 @@ class TUTKDirectSession:
         # survives the wrap. Byte-identical pre-wrap (the unwrap == raw idx while no wrap has
         # occurred). OFF reverts to the historical non-modular gate, which dead-stalls a continuous
         # stream ~every 46 min when idx wraps 65535->0 (audit H1, reproduced live 2026-06-10).
+        # ⚠ REGRESSION SWITCH, NOT A TUNABLE: OFF (=0) reopens a proven silent bug — keep it ON.
         self._idx_modular = os.environ.get("CUBOAI_IDX_MODULAR", "1") != "0"
+        # H1-SIBLING (default ON, 2026-07-23): the SECOND-STREAM dead-read. `done_upto` is a
+        # per-reader local that starts at -1, but the camera's AV message-index is SESSION-scoped
+        # and keeps advancing whether or not we are reading (live audio runs on ch0 even while
+        # video is stopped). So the FIRST _read_av_units of a session starts with idx ~0 and works,
+        # while a LATER one meets idx > 255, every fragment falls outside the accept window
+        # `done_upto < idx <= done_upto+256`, done_upto never advances, and the reader emits ZERO
+        # AUs — forever, silently (frags_recv climbs at the full live rate, au_video stays 0,
+        # au_incomplete 0, gap_now 0). This is the path a playback session's restore_live() lands
+        # on, i.e. the "always restore live" safety path. FIX: seed the window from the first
+        # accepted access-unit START instead of assuming the stream begins at index 0. NO-OP when
+        # the first index is already in window (every fresh-session stream, so every replay
+        # fixture) -> live/replay output byte-identical. `=0` reverts.
+        # ⚠ REGRESSION SWITCH, NOT A TUNABLE: OFF (=0) reopens the second-stream dead-read — keep ON.
+        self._idx_seed = os.environ.get("CUBOAI_IDX_SEED", "1") != "0"
+        # bound ioctl()'s reconnect-under-loss (see ioctl's docstring). Off the AV path.
+        # DEFAULT OFF: the premise that motivated it was REFUTED on the wire — see ioctl().
+        self._ioctl_fast_reconnect = os.environ.get("CUBOAI_IOCTL_FAST_RECONNECT", "0") == "1"
         # H1-sibling — IO cumulative-ACK wrap fix (gated, default OFF pending live confirmation).
         # `_data_ack` (wire [40:42], the camera's reliable IO/control message-index cum-ack) is an
         # unbounded monotonic int advanced by contiguity over a set of RAW u16 indices — so when the
@@ -2003,6 +2031,7 @@ class TUTKDirectSession:
         # fixture never reaches the wrap, so 36/0 only proves the tested range is unchanged — the new
         # wrap-crossing test is what licenses the flip (same bar as the H1 _idx_modular default-ON).
         # `=0` reverts to the legacy freeze-at-wrap path.
+        # ⚠ REGRESSION SWITCH, NOT A TUNABLE: OFF (=0) reopens the _data_ack freeze-at-wrap — keep ON.
         self._dataack_wrap = os.environ.get("CUBOAI_DATAACK_WRAP", "1") != "0"
         # minimum in-order wait (AU-indices) before advancing past an absent AU — the FIX#5
         # grace (~4 at LAN) is too short to wait out a >grace-late frag-burst, so the late-but-
@@ -2086,6 +2115,28 @@ class TUTKDirectSession:
         self._stat_ts_garbage = 0       # video AUs whose FRAMEINFO timestamp was garbage (~10%)
         self._stat_ts_regress = 0       # video AUs whose camera timestamp went backwards (monotonic)
         self._stat_last_ts = None       # last valid video timestamp_ms (for the monotonic check)
+        # ── OUTBOUND / MASKED-RECOVERY counters (audit 2026-07-23) ────────────────────────────
+        # EVERY wrong verdict in this project came from a rig that could only see ONE SIDE, and
+        # every counter above this line is RECEIVE-side: the ledger counts what ARRIVES, so a
+        # send-side fault (an ACK that never left, a reconnect papering over a protocol bug) is
+        # invisible and the session still reads "healthy". The ghost-conn bug hid for weeks behind
+        # exactly this: ioctl()'s auto-reconnect silently recovered it on Linux, so it presented as
+        # a macOS-only issue. These make the send side and the SILENT RECOVERIES observable. Pure
+        # int increments at existing send points -> no wire bytes, no timing change, no locks
+        # (the reader thread is the sole writer of the stream-path ones, as above).
+        self._stat_tx_ack = 0           # 0x09 ACK/SACK frames SENT (the reliable-channel heartbeat)
+        self._stat_tx_nak = 0           # 0x0a/0x0b NAK frames SENT (gated resend_mode)
+        self._stat_tx_ioctl = 0         # IOCTL request frames SENT (incl. retransmits — see tx_ioctl_retx)
+        self._stat_tx_ioctl_retx = 0    # of those, RETRANSMITS of an unanswered request (masked loss)
+        self._stat_tx_keepalive = 0     # keepalive replies SENT (pair with keepalive_err for a send ratio)
+        self._stat_tx_err = 0           # sendto() failures on ANY path (EWOULDBLOCK/OSError) — a wedged socket
+        self._stat_talk_resend = 0      # talkback frames re-sent to satisfy the camera's 0x09 SACK
+        # masked-recovery visibility: each of these is a path that SILENTLY papers over a failure.
+        self._stat_ioctl_timeout = 0    # _ioctl_once calls that timed out (before any retry)
+        self._stat_ioctl_retry = 0      # ioctl() retry iterations entered (the concealer)
+        self._stat_reconnects = 0       # full session reconnects performed inside ioctl()'s retry loop
+        self._stat_reconnect_fail = 0   # reconnect attempts that failed the handshake
+        self._stat_reconnect_s = 0.0    # cumulative seconds spent inside those reconnects (recovery cost)
         # mid-stream GET injection slot (None in every default path -> reader hooks inert,
         # stream byte-identical). Set by get_during_stream, serviced by _av_reader.
         self._get_inject = None
@@ -2738,6 +2789,7 @@ class TUTKDirectSession:
                            self._ack_ord, C, D, self._data_ack, sack=sack, ts32=ts32,
                            win=self._advertise_window),
             self._cam)
+        self._stat_tx_ack += 1                 # outbound visibility (audit 2026-07-23)
         self._seq += 1
         self._relseq += 1
         self._ack_ord += 1
@@ -2772,6 +2824,7 @@ class TUTKDirectSession:
                              resend_timeout_ms=self._RESEND_TIMEOUT_MS,
                              win=self._advertise_window),
             self._cam)
+        self._stat_tx_nak += 1                 # outbound visibility (audit 2026-07-23)
         self._seq += 1
         self._relseq += 1
 
@@ -2827,18 +2880,60 @@ class TUTKDirectSession:
         ACK frames carry [40:44] = the highest contiguous camera DATA message-index
         received, which advances the camera's response send-window so it serves
         request after request. A stalled call triggers one reconnect-and-retry.
+
+        BOUNDED RECONNECT (audit 2026-07-23, CUBOAI_IOCTL_FAST_RECONNECT, **default OFF**).
+        Caps this path's connect() to (attempts=3, timeout=1.5). It exists because the
+        send-side work order expected the legacy call to cost "up to ~64 s per reconnect
+        (attempts=8 x timeout=8.0), ~3 min across the retry loop". **That premise is
+        REFUTED**: connect()'s `deadline` is computed ONCE before the attempt loop, so
+        `timeout` is a TOTAL budget SHARED across `attempts`, not per-attempt — the legacy
+        worst case is ~8 s per reconnect, and the measured mean at 40% egress loss was
+        5.1 s (585 s / 115 reconnects). Recovery was never "minutes".
+        Worse, the live A/B did not show this helping. The real pathology at 40% loss is
+        not slow reconnects but ENDLESS CHURN — 115 reconnects of which 113 FAILED — and a
+        shorter budget makes the loop churn FASTER, not succeed more; it can only reduce
+        the handshake's chances. So this ships OFF and unproven: `=1` opts in. Do not flip
+        the default without an A/B where the ON arm actually establishes a session
+        (the 40%-loss attempt's ON arm never got past its initial connect).
+
+        Every recovery here is COUNTED regardless of the flag (_stat_ioctl_retry /
+        _stat_reconnects / _stat_reconnect_s, surfaced by get_stats) — that
+        instrumentation is what exposed the 115/113 churn, which previously just looked
+        like slow GETs. A retry that succeeds is not evidence
+        the underlying operation is sound — on Linux this very path silently masked the
+        ghost-conn bug for weeks, so it must never look free.
+
+        CONTRACT (B3-latent, audit 2026-07-24): while a stream is running, `_av_reader` is the
+        SOLE socket sender. Calling this ioctl() DIRECTLY mid-stream would add a second sender
+        that races seq/relseq/frmno and double-drains recvfrom — corrupting the AV stream. The
+        production streamer NEVER SETs mid-stream, so this cannot happen today, which is why there
+        is deliberately NO runtime assert here (an assert could only ever be discovered wrong in
+        production). Any future mid-stream GET/SET MUST go through get_during_stream()/the reader
+        thread, not this method. This note IS the guard.
         """
         last_err = None
+        _fast = self._ioctl_fast_reconnect
+        _cargs = dict(attempts=3, timeout=1.5) if _fast else {}
         for attempt in range(3):
+            if attempt:
+                self._stat_ioctl_retry += 1
             if self._sock is None or self.session_hdr is None:
                 self.disconnect()
-                if not self.connect():
+                self._stat_reconnects += 1      # count BEFORE: connect() may raise, and a
+                _t0 = time.time()              # reconnect that blew up still happened
+                try:
+                    _ok = self.connect(**_cargs)
+                finally:
+                    self._stat_reconnect_s += time.time() - _t0
+                if not _ok:
+                    self._stat_reconnect_fail += 1
                     last_err = "handshake failed (no 0x2041)"
                     time.sleep(0.2)
                     continue
             try:
                 return self._ioctl_once(type_code, payload, timeout=3.0)
             except TimeoutError as e:
+                self._stat_ioctl_timeout += 1
                 last_err = str(e)
                 self.disconnect()           # reconnect for the retry
                 time.sleep(0.2)
@@ -2857,6 +2952,7 @@ class TUTKDirectSession:
         self._relseq += 1
         self._frmno += 1
         s.sendto(req, self._cam)
+        self._stat_tx_ioctl += 1
         t0 = time.time()
         last_tx = t0
         while time.time() - t0 < timeout:
@@ -2867,6 +2963,11 @@ class TUTKDirectSession:
                                        type_code, payload)
                 self._seq += 1
                 s.sendto(req, self._cam)
+                # MASKED-FAILURE VISIBILITY (audit 2026-07-23): this retransmit is the loop that
+                # makes SETs loss-resilient — and it is also why a lossy link looks healthy from
+                # the outside. Count it so "recovered N times" is visible instead of silent.
+                self._stat_tx_ioctl += 1
+                self._stat_tx_ioctl_retx += 1
                 last_tx = now
             if not r:
                 continue
@@ -3005,6 +3106,24 @@ class TUTKDirectSession:
             'gap_cap_jumps': self._stat_gap_cap_jumps,
             'lone_skips': self._stat_lone_skips,
             'keepalive_err': self._stat_keepalive_err,   # L1
+            # ── OUTBOUND (audit 2026-07-23): everything above this line is RECEIVE-side.
+            # A rig that can only see one side has produced every wrong verdict in this
+            # project, so the send side is counted too: frames we emit, retransmits we
+            # issue, and sendto failures (a wedged socket used to be completely invisible).
+            'tx_ack': self._stat_tx_ack,
+            'tx_nak': self._stat_tx_nak,
+            'tx_ioctl': self._stat_tx_ioctl,
+            'tx_ioctl_retx': self._stat_tx_ioctl_retx,
+            'tx_keepalive': self._stat_tx_keepalive,
+            'tx_err': self._stat_tx_err,
+            'talk_resend': self._stat_talk_resend,
+            # ── SILENT RECOVERIES: a retry that succeeds is not evidence of health. These
+            # make a masked fault read as "recovered N times" instead of looking clean.
+            'ioctl_timeouts': self._stat_ioctl_timeout,
+            'ioctl_retries': self._stat_ioctl_retry,
+            'reconnects': self._stat_reconnects,
+            'reconnect_fail': self._stat_reconnect_fail,
+            'reconnect_s': round(self._stat_reconnect_s, 2),
             # PTS health
             'ts_valid': self._stat_ts_valid,
             'ts_garbage': self._stat_ts_garbage,
@@ -3543,8 +3662,10 @@ class TUTKDirectSession:
                             self._session_fp = xor_frame(raw)[16:20]  # echoed token (S49)
                             try:
                                 s.sendto(build_keepalive_reply(raw), addr)
+                                self._stat_tx_keepalive += 1    # outbound side of keepalive_err
                             except OSError:
                                 self._stat_keepalive_err += 1   # L1: observable instead of silent
+                                self._stat_tx_err += 1
                         continue
                     dec = inv_transcode(raw)
                     if len(dec) < 40:
@@ -3578,7 +3699,7 @@ class TUTKDirectSession:
                             gi.result = bytes(dec[68:min(len(dec), 68 + max(0, avlen - 4))])
                             gi.done.set()
                         continue
-                    idx = struct.unpack("<H", dec[56:58])[0]
+                    idx = raw_idx = struct.unpack("<H", dec[56:58])[0]
                     if self._idx_modular:                 # H1: lift the u16 index into done_upto's
                         idx = _unwrap_index(idx, done_upto)  # space so the gate survives the wrap
                     frag = struct.unpack("<H", dec[46:48])[0]
@@ -3604,6 +3725,16 @@ class TUTKDirectSession:
                         if not is_marker(chunk):
                             continue
                         gmax = frag
+                        # SECOND-STREAM dead-read fix (see _idx_seed): this is THIS reader's first
+                        # accepted access-unit start. done_upto still holds its -1 initialiser, but
+                        # the camera's message-index is session-scoped, so on any read after the
+                        # first it is already past the +256 accept window and EVERY fragment would
+                        # be rejected from here on. Anchor the window here instead. Fires only when
+                        # the index is out of window (never on a fresh-session stream), so the
+                        # normal path — and every replay fixture — is byte-identical.
+                        if self._idx_seed and not (done_upto < idx <= done_upto + 256):
+                            done_upto = raw_idx - 1
+                            idx = _unwrap_index(raw_idx, done_upto) if self._idx_modular else raw_idx
                     else:
                         fwd = (frag - gmax) & 0xFFFF
                         back = (gmax - frag) & 0xFFFF
@@ -3880,6 +4011,62 @@ class TUTKDirectSession:
         io_type, payload = builder_result
         return self.ioctl(io_type, payload)
 
+    def set_verified(self, name, value, readback_timeout=2.5):
+        """OPT-IN, SELECTIVE read-back verify for a SET (audit 2026-07-23, task 5).
+
+        A SET that returns a ..._RESP proves the camera ANSWERED, not that it APPLIED the value:
+        _ioctl_once retransmits until a response arrives, so the SET is loss-RESILIENT, but
+        "accepted but not applied" is a completely different failure from "failed" and nothing in
+        the stack could previously tell them apart. This performs the SET, reads the value back
+        through the paired GET, and reports the three outcomes DISTINCTLY.
+
+        Deliberately NOT blanket (it costs an extra GET per call, and many IOCTLs are actions with
+        no readable state): `name` must be a key of cuboai_messages.SET_READBACK — everything else
+        raises rather than pretending to verify. cuboai_messages.SET_READBACK_UNSUPPORTED records
+        why each excluded setter has no read-back.
+
+        NEVER touches the AV hot path: the read-back GET goes through get_during_stream(), which
+        hands the request to the reader thread when a stream is running (and falls back to a plain
+        ioctl when it is not), so verifying a setting mid-stream cannot race the socket.
+
+        Returns a dict; `verified` is the verdict and is None only when the read-back itself could
+        not be obtained (never silently True):
+          {'name','expected','actual','set_ok','verified','status','confidence','get'}
+          status: 'applied'        — SET answered AND the read-back agrees
+                  'not_applied'    — SET answered but the read-back DISAGREES  <-- the interesting one
+                  'unverified'     — SET answered; the read-back GET failed/returned no field
+                  'set_failed'     — the SET itself never got a response (raised)
+        """
+        import cuboai_messages as cm
+        try:
+            setter, kwarg, get_name, field, coerce, confidence = cm.SET_READBACK[name]
+        except KeyError:
+            why = cm.SET_READBACK_UNSUPPORTED.get(f"set_{name}")
+            raise ValueError(
+                f"'{name}' has no read-back capability"
+                + (f" ({why})" if why else "")
+                + f"; verifiable: {sorted(cm.SET_READBACK)}")
+        out = {'name': name, 'expected': coerce(value), 'actual': None, 'set_ok': False,
+               'verified': None, 'status': 'set_failed', 'confidence': confidence, 'get': get_name}
+        try:
+            getattr(self, setter)(**{kwarg: value})
+        except Exception as e:
+            out['error'] = repr(e)
+            return out
+        out['set_ok'] = True
+        out['status'] = 'unverified'
+        parsed = self.get_during_stream(get_name, timeout=readback_timeout)
+        if not isinstance(parsed, dict) or field not in parsed or parsed[field] is None:
+            return out                       # read-back unavailable -> verified stays None
+        try:
+            out['actual'] = coerce(parsed[field])
+        except (TypeError, ValueError):
+            out['actual'] = parsed[field]
+            return out
+        out['verified'] = (out['actual'] == out['expected'])
+        out['status'] = 'applied' if out['verified'] else 'not_applied'
+        return out
+
     def set_night_light(self, on):
         """Turn the night light on/off."""
         import cuboai_messages as cm
@@ -4149,6 +4336,8 @@ class TUTKDirectSession:
         next_audio = None                    # ABSOLUTE send schedule (anchored at the first frame); a
                                              # `now`-relative timer drifts ~+8ms/frame -> the camera
                                              # underruns (measured 72ms vs the 64ms it plays at) -> breakage
+        # ⚠ REGRESSION SWITCH, NOT A TUNABLE: OFF (=0) reopens the talkback resend-lookup wrap death.
+        _talk_wrap = os.environ.get("CUBOAI_TALK_WRAP", "1") != "0"   # see the SACK-replay lookup below
         period = 1024.0 / rate               # AAC frame duration (== 64 ms at 16 kHz): feed at EXACTLY this
         finished = False
         sent_buf = {}                        # talk_frag -> au, for resend on the camera's 0x09 SACK
@@ -4229,10 +4418,26 @@ class TUTKDirectSession:
                             if 0 < cnt < 256 and C != 0xFFFF:
                                 for k in range(min(cnt, (len(dec) - 50) // 2)):
                                     frag = (C + struct.unpack_from('<H', dec, 50 + 2 * k)[0]) & 0xFFFF
+                                    if _talk_wrap:
+                                        # WRAP FIX (audit 2026-07-23) — FOURTH instance of the u16-vs-
+                                        # unbounded-int class (after H1, _data_ack, PlaybackReader).
+                                        # `talk_frag` is deliberately MONOTONIC/unbounded (it must not
+                                        # restart when a looped file wraps its content), so sent_buf's
+                                        # keys are unbounded — but the SACK entry decodes to a u16.
+                                        # Past 65536 frames (64 ms/frame => ~70 min of continuous or
+                                        # looping talkback) every sent_buf.get(u16) MISSES and talkback
+                                        # loss-recovery SILENTLY STOPS (resends_sent just stops rising;
+                                        # the wire stays well-formed, so nothing looks wrong). Lift the
+                                        # u16 BACKWARD into talk_frag's space — resends are always for
+                                        # already-sent frames, so the nearest match at-or-below the
+                                        # current frag is the right one. Below the wrap this is the
+                                        # identity, so the wire is unchanged.
+                                        frag = _unwrap_index_back(frag, talk_frag)
                                     au = sent_buf.get(frag)
                                     if au is not None:
                                         s.sendto(build_talk_audio(R, channel, self._seq, talk_relseq, frag, frag, au), cam)
                                         self._seq += 1; talk_relseq += 1; resends_sent += 1
+                                        self._stat_talk_resend += 1    # outbound visibility
         finally:
             if spk_sent:                                          # SPEAKERSTOP {channel}
                 try:

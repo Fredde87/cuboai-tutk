@@ -50,7 +50,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cuboai_session import get_session   # auto-selects TUTKSession (--lib) or PureSession
-from cuboai_stream_video import apply_env_profile   # shared production/raw A/V env profile
+from cuboai_stream_video import apply_env_profile, _clamp_env_knobs, _env_float   # shared A/V env profile + knob clamp
 from cuboai_messages import (
     build_get_hw_control,
     build_get_light_style,
@@ -909,35 +909,6 @@ def run_benchmark(transport, interval=2.0, cap=None, csv_path=None):
           flush=True)
 
 
-def _clamp_env_knobs():
-    """Range-clamp the numeric CUBOAI_* tuning env vars (startup only, stderr only) so a zero/absurd
-    override can't divide-by-zero or break recovery. Non-numeric -> default; out-of-range -> clamp."""
-    KNOBS = [  # (env, lo, hi, default-or-None, is_float)
-        ('CUBOAI_GAP_DEPTH_CAP', 1, 10000, 200, False),
-        ('CUBOAI_RECOVERY_HOLD', 0, 2000, 24, False),
-        ('CUBOAI_LONE_SKIP_ROUNDS', 0, 2000, 20, False),
-        ('CUBOAI_KF_HOLD', 0, 2000, 40, False),
-        ('CUBOAI_GAP_HOLD_MS', 1, 600000, None, False),
-        ('CUBOAI_VERBOSE_INTERVAL', 0.1, 3600, 5.0, True),
-        ('CUBOAI_VERBOSE_CAMERA_STATS_INTERVAL', 1, 86400, None, False),
-    ]
-    for env, lo, hi, dflt, isf in KNOBS:
-        raw = os.environ.get(env)
-        if not raw:
-            continue
-        try:
-            v = float(raw) if isf else int(raw)
-        except ValueError:
-            if dflt is not None:
-                os.environ[env] = str(dflt)
-                print(f"Warning: {env}={raw!r} is not a number; using default {dflt}.", file=sys.stderr)
-            continue
-        cv = min(hi, max(lo, v))
-        if cv != v:
-            os.environ[env] = str(cv if isf else int(cv))
-            print(f"Warning: {env}={raw} out of range [{lo},{hi}]; clamped to {cv}.", file=sys.stderr)
-
-
 def _validate_startup(args, uid, account, password, camera_ip):
     """Startup-only input validation: stderr only, never the per-frame hot path or stdout. Hard-fails
     (exit 2) on malformed required input with a clear message; clamps out-of-range env knobs."""
@@ -1066,7 +1037,7 @@ def list_recordings(transport, hours=6):
     # the app, so 0.5s is the parity value (wire A/B served 5/5 at 2.5s; native proves 0.5s in the app;
     # the intermediate isn't separately wire-pinned — raise this if a fast scan ever restarts wedging).
     # Only fast SERVED pulls are governed by this gap; starved pulls already burn the recv timeout.
-    PACE_S = float(os.environ.get("CUBOAI_LIST_PACE_S", "0.5"))
+    PACE_S = _env_float("CUBOAI_LIST_PACE_S", 0.5)   # B-8/R3: defensive parse (also clamped at startup)
     # NATIVE-MATCH scan path (default ON): NativeScanSession runs a persistent single-reader thread
     # (the native IOTC service-thread analog) so the whole scan rides ONE session with no reader gap,
     # like the app. The camera still won't serve a 2nd DownloadFile on a session (a camera-side limit,
@@ -1078,43 +1049,46 @@ def list_recordings(transport, hours=6):
     if os.environ.get("CUBOAI_RDT_SCAN_SERVICE", "1") == "1":
         try: svc = pb.NativeScanSession(inner).start()
         except Exception: svc = None
-    for h in range(1, max(1, hours) + 1):         # start at 1 => skip the growing current hour
-        if h > 1 and PACE_S > 0 and svc is None:
-            time.sleep(PACE_S)                     # legacy path: let the camera release the prev conn_id
-        hdt = now_utc - _dt.timedelta(hours=h)
-        loc = hdt.astimezone()
-        # print the hour + flush BEFORE the pull so a multi-second pull never looks locked up.
-        print(f"   {loc:%Y-%m-%d %H}:00 local  (UTC {hdt:%H}:00)   …", end="", flush=True)
-        diag = {}
+    try:
+        for h in range(1, max(1, hours) + 1):     # start at 1 => skip the growing current hour
+            if h > 1 and PACE_S > 0 and svc is None:
+                time.sleep(PACE_S)                 # legacy path: let the camera release the prev conn_id
+            hdt = now_utc - _dt.timedelta(hours=h)
+            loc = hdt.astimezone()
+            # print the hour + flush BEFORE the pull so a multi-second pull never looks locked up.
+            print(f"   {loc:%Y-%m-%d %H}:00 local  (UTC {hdt:%H}:00)   …", end="", flush=True)
+            diag = {}
+            if svc is not None:
+                recs, resp = svc.download_manifest(hdt, timeout=6, diag=diag)
+            else:
+                recs, resp = pb.pull_manifest(transport, hdt, timeout=6, retries=0, diag=diag)
+            n = cov.add_manifest(recs) if recs else 0
+            # per-pull truth (workorder Step 1): order, hour, rdtChannel, stopped_reason, data, elapsed
+            reason = diag.get("stopped_reason") or "?"
+            ch = diag.get("rdtChannel")
+            det = (f"ch={ch} reason={reason} data={diag.get('data_seen')} "
+                   f"hello={diag.get('hellos_seen')} cid={diag.get('first_hello_cid')}"
+                   f" tries={diag.get('attempts')} bytes={diag.get('got_bytes')}/"
+                   f"{diag.get('file_size')} {diag.get('elapsed', 0):.1f}s")
+            if n:
+                tag = f"✅ {n:2d}/60 min with footage"
+            elif diag.get("stopped_reason") in ("no_manifest",) or (
+                    resp is not None and getattr(resp, 'file_size', 0) <= 0):
+                tag = "— no manifest (idle / not recorded)"
+            elif diag.get("stopped_reason") == "ioctl_timeout":
+                tag = "✗ 0x910 timed out (camera busy / IO window)"
+            elif diag.get("stopped_reason") == "never_started":
+                tag = "✗ RDT never started (HELLOs, no DATA)"
+            elif diag.get("stopped_reason") == "short_read":
+                tag = "✗ short read (DATA lost, unrecovered)"
+            else:
+                tag = "— (unavailable)"
+            print(f"\r   {loc:%Y-%m-%d %H}:00 local  (UTC {hdt:%H}:00)   {tag}   [{det}]")
+    finally:
+        # B-5: a pull raising mid-scan must NOT leak the reader thread + socket ownership.
         if svc is not None:
-            recs, resp = svc.download_manifest(hdt, timeout=6, diag=diag)
-        else:
-            recs, resp = pb.pull_manifest(transport, hdt, timeout=6, retries=0, diag=diag)
-        n = cov.add_manifest(recs) if recs else 0
-        # per-pull truth (workorder Step 1): order, hour, rdtChannel, stopped_reason, data, elapsed
-        reason = diag.get("stopped_reason") or "?"
-        ch = diag.get("rdtChannel")
-        det = (f"ch={ch} reason={reason} data={diag.get('data_seen')} "
-               f"hello={diag.get('hellos_seen')} cid={diag.get('first_hello_cid')}"
-               f" tries={diag.get('attempts')} bytes={diag.get('got_bytes')}/"
-               f"{diag.get('file_size')} {diag.get('elapsed', 0):.1f}s")
-        if n:
-            tag = f"✅ {n:2d}/60 min with footage"
-        elif diag.get("stopped_reason") in ("no_manifest",) or (
-                resp is not None and getattr(resp, 'file_size', 0) <= 0):
-            tag = "— no manifest (idle / not recorded)"
-        elif diag.get("stopped_reason") == "ioctl_timeout":
-            tag = "✗ 0x910 timed out (camera busy / IO window)"
-        elif diag.get("stopped_reason") == "never_started":
-            tag = "✗ RDT never started (HELLOs, no DATA)"
-        elif diag.get("stopped_reason") == "short_read":
-            tag = "✗ short read (DATA lost, unrecovered)"
-        else:
-            tag = "— (unavailable)"
-        print(f"\r   {loc:%Y-%m-%d %H}:00 local  (UTC {hdt:%H}:00)   {tag}   [{det}]")
-    if svc is not None:
-        try: svc.close()
-        except Exception: pass
+            try: svc.close()
+            except Exception: pass
     if not cov.count:
         print("\n   ⚠ No footage could be pulled — every hour returned never_started (HELLOs, 0 DATA).")
         print("     The camera's RDT is wedged on a conn_id (a prior/too-fast pull it hasn't released")

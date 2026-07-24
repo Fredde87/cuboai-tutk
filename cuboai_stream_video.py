@@ -101,6 +101,50 @@ RAW_ENV = {
 }
 
 
+def _env_float(name: str, default: float) -> float:
+    """Parse a CUBOAI_* env var as float, falling back to `default` on empty/non-numeric input
+    (B-8/R3 — the previous bare float(os.environ[...]) raised an uncaught ValueError on garbage)."""
+    try:
+        raw = os.environ.get(name, '')
+        return float(raw) if raw else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _clamp_env_knobs():
+    """Range-clamp the numeric CUBOAI_* tuning env vars (startup only, stderr only) so a zero/absurd
+    override can't divide-by-zero or break recovery. Non-numeric -> default; out-of-range -> clamp.
+
+    Lives in the shared streamer module (B-8) so BOTH the production streamer (apply_env_profile)
+    and the validate CLI sanitise identically — the streamer used to skip clamping entirely, so a
+    bad CUBOAI_* only got caught under `cuboai_validate`, never on the go2rtc exec path."""
+    KNOBS = [  # (env, lo, hi, default-or-None, is_float)
+        ('CUBOAI_GAP_DEPTH_CAP', 1, 10000, 200, False),
+        ('CUBOAI_RECOVERY_HOLD', 0, 2000, 24, False),
+        ('CUBOAI_LONE_SKIP_ROUNDS', 0, 2000, 20, False),
+        ('CUBOAI_KF_HOLD', 0, 2000, 40, False),
+        ('CUBOAI_GAP_HOLD_MS', 1, 600000, None, False),
+        ('CUBOAI_VERBOSE_INTERVAL', 0.1, 3600, 5.0, True),
+        ('CUBOAI_VERBOSE_CAMERA_STATS_INTERVAL', 1, 86400, None, False),
+        ('CUBOAI_LIST_PACE_S', 0, 3600, 0.5, True),   # B-8/R3: also parsed with a bare float()
+    ]
+    for env, lo, hi, dflt, isf in KNOBS:
+        raw = os.environ.get(env)
+        if not raw:
+            continue
+        try:
+            v = float(raw) if isf else int(raw)
+        except ValueError:
+            if dflt is not None:
+                os.environ[env] = str(dflt)
+                print(f"Warning: {env}={raw!r} is not a number; using default {dflt}.", file=sys.stderr)
+            continue
+        cv = min(hi, max(lo, v))
+        if cv != v:
+            os.environ[env] = str(cv if isf else int(cv))
+            print(f"Warning: {env}={raw} out of range [{lo},{hi}]; clamped to {cv}.", file=sys.stderr)
+
+
 def apply_env_profile(raw: bool) -> str:
     """Install the env profile and return the resolved output format.
 
@@ -110,6 +154,8 @@ def apply_env_profile(raw: bool) -> str:
                 env var). The engine reads these at construction, so this MUST run before
                 get_session().
     """
+    _clamp_env_knobs()          # B-8: sanitise numeric CUBOAI_* on the streamer path too (was
+                                # validate-only) — a bad knob must never reach get_session().
     if raw:
         for k, v in RAW_ENV.items():
             os.environ[k] = v
@@ -156,6 +202,16 @@ def _verbose_loop(sess, interval, camera_stats, stop):
                 f"gap {cur['gap_now']} (max {cur['gap_max']}, capjmp {cur['gap_cap_jumps']}) | "
                 f"incAU {d['au_incomplete']} kf {d['kf_incomplete']}/{d['kf_total']} | "
                 f"ts garbage {gpct:.0f}% regress {cur['ts_regress']}")
+        # SILENT-RECOVERY VISIBILITY (audit 2026-07-23). ioctl()'s auto-reconnect masked the
+        # ghost-conn bug for weeks on Linux — a path that quietly recovers must never read as
+        # healthy. Print the send side + the recoveries ONLY when non-zero, so a clean session's
+        # line is unchanged and any occurrence stands out. stderr only (stdout is the media pipe).
+        _rec = (cur.get('reconnects', 0), cur.get('ioctl_retries', 0),
+                cur.get('tx_ioctl_retx', 0), cur.get('tx_err', 0), cur.get('keepalive_err', 0))
+        if any(_rec):
+            line += (f" | RECOVERED reconn {_rec[0]} (fail {cur.get('reconnect_fail', 0)}, "
+                     f"{cur.get('reconnect_s', 0)}s) ioctl-retry {_rec[1]} ioctl-retx {_rec[2]} "
+                     f"txerr {_rec[3]} kaerr {_rec[4]}")
         if camera_stats and tick % 6 == 0:          # slow cadence (~6× the interval)
             try:
                 ss = sess.get_during_stream('get_session_stats', timeout=1.5) or {}
@@ -342,8 +398,7 @@ def main() -> None:
     _v_stop = None
     if verbose:
         import threading as _threading
-        v_interval = (args.verbose_interval
-                      or float(os.environ.get('CUBOAI_VERBOSE_INTERVAL', '') or 5.0))
+        v_interval = args.verbose_interval or _env_float('CUBOAI_VERBOSE_INTERVAL', 5.0)
         v_camera = (args.verbose_camera_stats
                     or os.environ.get('CUBOAI_VERBOSE_CAMERA_STATS', '0') != '0')
         _v_stop = _threading.Event()
