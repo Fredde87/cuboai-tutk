@@ -68,6 +68,7 @@ import ctypes
 import io
 import os
 import platform
+import queue
 import subprocess
 import tempfile
 import time
@@ -626,10 +627,10 @@ class TUTKSession:
                 a = self.recv_audio_frame()
                 if v:
                     try: q.put(('video', v), timeout=0.1)
-                    except: pass
+                    except queue.Full: pass
                 if a:
                     try: q.put(('audio', a), timeout=0.1)
-                    except: pass
+                    except queue.Full: pass
                 if not v and not a:
                     time.sleep(0.001)
 

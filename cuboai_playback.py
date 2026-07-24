@@ -19,7 +19,7 @@ M1 (this file, offline-testable half): builders/parsers + coverage. The RDT rece
 (RdtReceiver) and the live pull/playback glue land in later milestones.
 """
 from __future__ import annotations
-import struct, json, datetime, time, queue, threading, select
+import struct, json, datetime, time, queue, threading, select, sys
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -289,6 +289,23 @@ def build_rdt_packet(ptype, seqL=0, seqH=0, conn_id=0, payload=b"", b16=0, b18=0
     struct.pack_into("<H", p, 18, b18 & 0xFFFF)
     return bytes(p) + payload
 
+def rdt_close_packets(native_close, conn_ids):
+    """RDT teardown frames, ONE per conn_id — the SINGLE source of truth for RDT close, shared by
+    RdtReceiver._close_all and NativeScanSession's pull teardown so the two can never drift again
+    (C3 — they had already diverged twice: B-2 was NativeScanSession still sending the malformed
+    legacy FIN on the DEFAULT scan path while RdtReceiver had moved to the native CLOSE).
+
+    native_close=True  -> native RDT_Destroy CLOSE(0x04, seq=0)              [2x2 wire-proven: cids advance]
+    native_close=False -> legacy FIN(0x03, seq=0xFFFFFFFF)                   [malformed in type AND seq]
+
+    Native sends ONLY the CLOSE (never the FIN), so we emit exactly ONE frame per conn_id — matching
+    the app on the wire — rather than the old FIN+CLOSE pair."""
+    for c in conn_ids:
+        if native_close:
+            yield build_rdt_packet(RDT_CLOSE, seqL=0, seqH=0, conn_id=c)
+        else:
+            yield build_rdt_packet(RDT_FIN, seqL=0xFFFFFFFF, seqH=0xFFFFFFFF, conn_id=c)
+
 def build_rdt_frame(R, mid, seq, channel, rdt_packet):
     """IOTC channel-data frame (host->cam) carrying an RDT packet at [28]; transcode()d
     (data channel => swap_tail default). Mirrors the camera's observed cam->host frame."""
@@ -505,13 +522,9 @@ class RdtReceiver:
         This is the unattended SENSOR-poll path, so it must not rely on the camera never happening to
         open a 2nd conn. native_close selects native RDT_Destroy CLOSE(0x04,seq=0) [2x2 wire-proven:
         cids advance]; native_close=0 reverts to the legacy FIN(0x03,seq=0xFFFFFFFF)."""
-        for c in (set(self.conn_ids) or {self.conn_id or 0}):
+        for pkt in rdt_close_packets(self.native_close, set(self.conn_ids) or {self.conn_id or 0}):
             try:
-                if self.native_close:
-                    self._send_rdt(build_rdt_packet(RDT_CLOSE, seqL=0, seqH=0, conn_id=c))
-                else:
-                    self._send_rdt(build_rdt_packet(RDT_FIN, seqL=0xFFFFFFFF, seqH=0xFFFFFFFF,
-                                                    conn_id=c))
+                self._send_rdt(pkt)
             except Exception:
                 pass
 
@@ -826,6 +839,9 @@ class NativeScanSession:
         self.rdt_frames_seen = 0       # diag: total RDT frames the reader parsed (any channel)
         # native_open temp-id source (shared with RdtReceiver's process counter)
         self._native_open = _os_env("CUBOAI_RDT_NATIVE_OPEN", "1") == "1"
+        # B-2: honour CUBOAI_RDT_NATIVE_CLOSE here TOO — the pull teardown used to ignore it and
+        # always emit the malformed legacy FIN on this (default) scan path. Shared with RdtReceiver.
+        self._native_close = _os_env("CUBOAI_RDT_NATIVE_CLOSE", "1") == "1"
 
     def start(self):
         self.sock.setblocking(False)
@@ -838,6 +854,15 @@ class NativeScanSession:
         self._stop.set()
         try: self._reader.join(1.5)
         except Exception: pass
+
+    # Context-manager form (LOW-5) so the reader thread + socket ownership are ALWAYS torn
+    # down, even when a pull raises mid-scan (was: an exception skipped the explicit close()).
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
 
     # ---- locked low-level sends (single seq owner) ----
     def _sendto(self, frame):
@@ -862,6 +887,11 @@ class NativeScanSession:
                     self.sock.sendto(frame, self.inner._cam); return
                 except (BlockingIOError, OSError):
                     time.sleep(0.003)
+            # All 30 retries blocked: the RDT frame (often the FIN/CLOSE) was DROPPED. This is the
+            # exact ghost-conn precursor — surface it instead of returning silently.
+            if self.verbose:
+                print(f"[scan] _send_rdt: send buffer stayed full for 30 retries "
+                      f"(ch={channel}) — RDT frame DROPPED (possible ghost-conn)", file=sys.stderr)
 
     # ---- the persistent reader (sole socket recv) ----
     def _loop(self):
@@ -971,20 +1001,22 @@ class NativeScanSession:
                 if asm.data_seen == 0 and now - last_hello > 0.5:               # native_open retransmit
                     self._send_rdt(channel, build_rdt_packet(RDT_HELLO, conn_id=cid)); last_hello = now
                 time.sleep(0.02)
-            # native RDT_Destroy teardown FIN(0x03,seq=0xFFFFFFFF)+CLOSE(0x04,seq=0), delivered RELIABLY,
-            # then DRAIN until the camera STOPS the RDT stream. If we return while the camera is still
-            # sending (retransmitting the tail), the RDT stays open at the camera -> ghost session that
-            # blocks the next DownloadFile (the macOS symptom). self._rdt stays set so the reader keeps
-            # CACKing trailing DATA; resend FIN+CLOSE while the camera is still active; stop on quiet.
+            # native RDT_Destroy teardown (CLOSE(0x04,seq=0) by default, via rdt_close_packets),
+            # delivered RELIABLY, then DRAIN until the camera STOPS the RDT stream. If we return while
+            # the camera is still sending (retransmitting the tail), the RDT stays open at the camera
+            # -> ghost session that blocks the next DownloadFile (the macOS symptom). self._rdt stays
+            # set so the reader keeps CACKing trailing DATA; resend the close while the camera is still
+            # active; stop on quiet.
             def _close_all():
-                # FIN+CLOSE EVERY conn the camera opened. The camera opens a SECOND RDT conn (seen on
+                # Close EVERY conn the camera opened. The camera opens a SECOND RDT conn (seen on
                 # macOS as cid=40) that we HELLO_ACK'd; closing only the DATA stream (cid=1) leaves it
                 # open -> the camera HELLO-hammers it forever = ghost session that blocks the next
                 # DownloadFile. Closing all conn_ids (and any new one that appears during the drain)
-                # makes the camera go quiet, like Linux.
+                # makes the camera go quiet, like Linux. B-2: honour native_close (was hard-wired to
+                # the malformed legacy FIN); rdt_close_packets is the shared source with RdtReceiver.
                 for c in (set(asm.conn_ids) or {0}):
-                    self._send_rdt(channel, build_rdt_packet(RDT_FIN, seqL=0xFFFFFFFF, seqH=0xFFFFFFFF, conn_id=c))
-                    self._send_rdt(channel, build_rdt_packet(RDT_CLOSE, seqL=0, seqH=0, conn_id=c))
+                    for pkt in rdt_close_packets(self._native_close, {c}):
+                        self._send_rdt(channel, pkt)
             _close_all()
             _end = time.time() + 1.5
             _last = self.rdt_frames_seen; _quiet = time.time()
@@ -1108,13 +1140,27 @@ class PlaybackReader:
     _HOLD_MAX = 48              # max AUs to HOLD an unproven-complete AU before force-emitting (see _emit)
 
     def __init__(self, channel, grace_msgs=3):
+        import os as _os
         import cuboai_pure as cp
         self.cp = cp
         self.channel = channel
         self.grace = grace_msgs
+        # WRAP FIX (audit C2, 2026-07-23) — THIRD instance of the "non-modular compare on a u16 wire
+        # counter" class (after AV done_upto/H1 and _data_ack/CUBOAI_DATAACK_WRAP). The DVR msg-index
+        # [56:48] and frag-seq [46:48] are u16 and WRAP at 65536; `self.hi`/`self.done_upto` were
+        # unbounded Python ints compared RAW. At the msg-index wrap (~72 min of continuous playback at
+        # ~15 AU/s) `idx` restarts near 0 while `hi` sits at 65535, so `idx > self.hi` never fires
+        # again: `hi` freezes, `_emit`'s `while i <= self.hi` runs dry and the playback stream
+        # SILENTLY DEAD-STALLS (exactly H1's failure mode, one file over). ON: lift each index into
+        # done_upto's unbounded space (cp._unwrap_index, the H1 helper) and drop only genuinely-stale
+        # (modularly BEHIND) indices; also make the per-AU fragment ordering/contiguity test modular
+        # so an AU straddling the frag-seq wrap isn't misread as non-contiguous. `=0` reverts to the
+        # exact legacy comparisons. Pre-wrap output is byte-identical (test_playback_wrap.py).
+        self._wrapfix = _os.environ.get("CUBOAI_PB_WRAP", "1") != "0"
         self.msgs = {}          # msg-index -> {frag-seq: chunk}
-        self.hi = -1            # highest msg-index seen
+        self.hi = -1            # highest msg-index seen (wrapfix: in done_upto's unbounded space)
         self.done_upto = -1     # highest msg-index emitted/skipped
+        self.stale = 0          # frames dropped as modularly-behind duplicates (wrapfix only)
         self.frag_hi = None     # highest frag-seq [46:48] seen (for channel-N ACK C/D)
         self.frag_prev = 0xFFFF
         self.frames = 0         # channel-N fragments fed
@@ -1184,6 +1230,19 @@ class PlaybackReader:
                                   if ((self.frag_hi - f) & 0xFFFF) <= 2048}
         if self.done_upto < 0:
             self.done_upto = idx - 1
+        if self._wrapfix:
+            # Lift the u16 wire index into done_upto's unbounded monotonic space. Pre-wrap this is
+            # the identity for every FORWARD index, so behaviour is unchanged until the first wrap;
+            # across it the space continues 65535 -> 65536 and the `> self.hi` / `i <= self.hi`
+            # compares keep working. A modularly-BEHIND index (a duplicate/late frag for an AU we
+            # already emitted or skipped) lifts to > +32768 and is dropped — legacy parked it in
+            # `self.msgs` where nothing ever popped it (a slow leak), so dropping it changes no
+            # output. Forward gaps up to 32767 AUs are still accepted, i.e. no new stall mode.
+            _d = (idx - self.done_upto) & 0xFFFF
+            if _d == 0 or _d > 0x8000:
+                self.stale += 1
+                return
+            idx = self.done_upto + _d
         self.msgs.setdefault(idx, {})[frag] = chunk
         if idx > self.hi:
             self.hi = idx
@@ -1191,6 +1250,16 @@ class PlaybackReader:
 
     def flush(self, out):
         self._emit(out, final=True)
+
+    @staticmethod
+    def _frag_sorted(fm):
+        """Frag-seqs of ONE AU in wire order, wrap-safe (wrapfix): order by SIGNED modular offset
+        from an arbitrary member, so an AU straddling the u16 frag-seq wrap (…65534, 65535, 0, 1…)
+        orders — and tests contiguous — exactly as it would mid-range. An AU spans ~69 frags, far
+        under the 0x8000 half-space, so the offset ordering is independent of which member seeds it.
+        Pre-wrap this returns exactly `sorted(fm)`, so nothing changes below the wrap."""
+        k0 = next(iter(fm))
+        return sorted(fm, key=lambda k: ((k - k0 + 0x8000) & 0xFFFF) - 0x8000)
 
     def _emit(self, out, final=False):
         """Emit AUs as (kind, unit, info) where info is the parsed FRAMEINFO dict (or None).
@@ -1214,7 +1283,10 @@ class PlaybackReader:
             j = i + 1
             while j <= self.hi and j not in self.msgs:
                 j += 1
-            nf = min(self.msgs[j]) if (j <= self.hi and j in self.msgs) else None
+            if j <= self.hi and j in self.msgs:
+                nf = (self._frag_sorted(self.msgs[j])[0] if self._wrapfix else min(self.msgs[j]))
+            else:
+                nf = None
             edge_reached = (nf is not None and self.frag_una is not None
                             and ((self.frag_una - nf) & 0xFFFF) < 0x8000)
             expired = final or (self.hi - i) > self._HOLD_MAX
@@ -1222,11 +1294,16 @@ class PlaybackReader:
                 break                            # HOLD AU i (and all after) for an in-flight resend
             fm = self.msgs.pop(i, None)
             if fm:
-                ks = sorted(fm)
+                ks = self._frag_sorted(fm) if self._wrapfix else sorted(fm)
                 # complete AU: the fragment-seqs [46:48] are the GLOBAL frag counter (consecutive
                 # but NOT starting at 0 per-AU), so completeness = CONTIGUOUS, any start (like the
                 # live reader's (ks[-1]-ks[0]+1)==len(ks)). Concatenate in frag-seq order.
-                if ks and (ks[-1] - ks[0] + 1) == len(ks):
+                # wrapfix: the span is measured modularly, so an AU straddling the frag-seq wrap
+                # reads contiguous instead of spanning a phantom 65536 (legacy dropped that AU and
+                # stuttered the hold for _HOLD_MAX AUs once per 65536 frags).
+                _span = (((ks[-1] - ks[0]) & 0xFFFF) + 1 if self._wrapfix
+                         else (ks[-1] - ks[0] + 1)) if ks else 0
+                if ks and _span == len(ks):
                     unit = b"".join(fm[k] for k in ks)
                     kind = _classify_au(unit)
                     if kind == 'video':
@@ -1411,6 +1488,7 @@ class PlaybackSession:
         self._cam_clock_N = None       # session ms-clock from cam->host 0x0a [36:38] (any channel)
         self._cam_clock_ts_N = None    # local time when the clock was captured
         self._nak0a_seen = 0           # cam->host 0x0a frames seen on channel N (instrumentation)
+        self._feed_errors = 0          # B-6: malformed frames that raised in reader.feed (skipped)
         # PER-CHANNEL reliable-frame state for the playback channel (native parity: nat.pcap shows
         # seq/relseq/ackord kept SEPARATELY per channel — sharing inner's breaks the camera's
         # per-channel reliable-stream tracking → SACK ignored). Reset per start()/seek().
@@ -1522,7 +1600,7 @@ class PlaybackSession:
         if not self._live_stopped:
             self._stop_live_video(); time.sleep(0.4)
         N = self._start_playback_ioctl(target, disable_timecontrol)
-        if N is None or N < 0:
+        if N is None or N < 1:                    # channel 0 is LIVE — never run playback on it
             raise RuntimeError(f"0x31a START rejected (result={N}) for target={target}")
         self.channel = N; self.target = target
         self.reader = PlaybackReader(N)
@@ -1611,7 +1689,16 @@ class PlaybackSession:
                     self._cam_clock_ts_N = time.time()
                     if dec[14] == N:
                         self._nak0a_seen += 1
-                reader.feed(dec, drained)
+                # B-6: reader.feed parses AU/ADTS headers; a malformed frame that raises must NOT
+                # kill this daemon thread (that death is silent — read() just times out with no log,
+                # leaving the camera in playback with no reader). Skip the bad frame, keep going.
+                try:
+                    reader.feed(dec, drained)
+                except Exception as e:
+                    self._feed_errors += 1
+                    if self._feed_errors <= 5:
+                        self._log(f"reader.feed raised on a frame "
+                                  f"({type(e).__name__}: {e}) — skipping, playback continues")
             for au in drained:
                 if (not engaged and au[0] == 'video' and au[2] and au[2].get('ts_sec')
                         and (self.target is None
@@ -1629,7 +1716,8 @@ class PlaybackSession:
         self.stats.update(frames=reader.frames, aus_video=reader.frames_video,
                           aus_audio=reader.frames_audio, dropped=reader.dropped,
                           honored=reader.honored, cam0a_seen=self._nak0a_seen,
-                          req_frags=len(reader.req_frags), sub2=reader.sub2)
+                          req_frags=len(reader.req_frags), sub2=reader.sub2,
+                          feed_errors=self._feed_errors)
 
     def _stop_reader(self):
         if self._thread is not None:
@@ -1667,7 +1755,7 @@ class PlaybackSession:
         # START (with socket drain + channel validation) directly — live is already stopped, so we
         # must NOT go through start()'s _stop_live_video path again.
         N = self._start_playback_ioctl(new_target, disable_timecontrol)
-        if N is None or N < 0:
+        if N is None or N < 1:                    # channel 0 is LIVE — never run playback on it
             raise RuntimeError(f"seek 0x31a START rejected (result={N}) for target={new_target}")
         self.channel = N; self.target = new_target
         self.reader = PlaybackReader(N); self._hole_req = {}
@@ -1723,8 +1811,8 @@ def mux_playback_stream(pbsess, writer, duration=None, idle_timeout=3.0,
     mux = cuboai_mpegts.TSMuxer(codec='hevc', audio_codec='aac')
     _log = log or (lambda *a: None)
     t0 = time.time(); last_au = t0; nv = na = 0; kf = 0
-    v_ts = []                                          # recorded video ts_sec (to prove ts≈target)
-    v_lo = v_hi = None                                 # running recorded-ts span (for record_seconds)
+    v_ts_n = 0                                         # count of recorded video AUs carrying a ts_sec
+    v_lo = v_hi = None                                 # running recorded-ts span (min/max + record_seconds)
     while True:
         if stop_flag is not None and stop_flag.is_set():
             break
@@ -1747,7 +1835,7 @@ def mux_playback_stream(pbsess, writer, duration=None, idle_timeout=3.0,
                 nv += 1
                 if p['keyframe']: kf += 1
                 if info and info.get('ts_sec'):
-                    ts = info['ts_sec']; v_ts.append(ts)
+                    ts = info['ts_sec']; v_ts_n += 1
                     v_lo = ts if v_lo is None else min(v_lo, ts)
                     v_hi = ts if v_hi is None else max(v_hi, ts)
             elif kind == 'audio':
@@ -1761,8 +1849,7 @@ def mux_playback_stream(pbsess, writer, duration=None, idle_timeout=3.0,
         if on_stats and (nv + na) % 200 == 0:
             on_stats(dict(video=nv, audio=na))
     return dict(video=nv, audio=na, keyframes=kf, seconds=time.time() - t0,
-                v_ts_min=min(v_ts) if v_ts else None, v_ts_max=max(v_ts) if v_ts else None,
-                v_ts_count=len(v_ts))
+                v_ts_min=v_lo, v_ts_max=v_hi, v_ts_count=v_ts_n)
 
 
 # ── offline self-test ─────────────────────────────────────────────────────────────

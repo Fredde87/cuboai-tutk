@@ -18,8 +18,7 @@ IOTC SESSION KEEPALIVE (plaintext, no library needed):
 """
 from __future__ import annotations
 import struct
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 
 # ---------------------------------------------------------------------------
@@ -32,14 +31,17 @@ IOTYPE_USER_IPCAM_START                 = 511
 IOTYPE_USER_IPCAM_AUDIOSTART            = 768
 
 # Device info
-IOTYPE_USER_GET_CONNECTED_USER_REQ      = 2320
-IOTYPE_USER_GET_CONNECTED_USER_RESP     = 2321
+# (GET_CONNECTED_USER lives in the "Connected users" section below as 2458/2459 — an earlier
+#  2320/2321 guess here was wrong and only ever shadowed, so it has been removed.)
 IOTYPE_USER_SLEEP_SAFETY_STATUS_REQ     = 2336
 IOTYPE_USER_SLEEP_SAFETY_STATUS_RESP    = 2337
 IOTYPE_USER_GET_PRIVACY_MODE_REQ        = 2344
 IOTYPE_USER_GET_PRIVACY_MODE_RESP       = 2345
 
 # Lullaby
+# ⚠ OPCODE COLLISION: 2404/2405 is ALSO GET_LIGHT_WAY_STATUS (see below). Same numeric opcode
+#   used by two features — the request context (which channel/feature you're talking to) decides
+#   which. Do NOT assume a 2404 response is a lullaby list without checking the feature.
 IOTYPE_USER_GET_LULLABY_INFO_REQ        = 2404   # get song list
 IOTYPE_USER_GET_LULLABY_INFO_RESP       = 2405
 IOTYPE_USER_SET_LULLABY_ACTION_REQ      = 2434   # play / stop
@@ -82,6 +84,8 @@ IOTYPE_USER_GET_TEMP_HUMIDITY_RESP      = 4373
 # Lullaby schedule/list
 IOTYPE_USER_GET_LULLABY_SCHEDULES_REQ   = 4866
 IOTYPE_USER_GET_LULLABY_SCHEDULES_RESP  = 4867
+# ⚠ OPCODE COLLISION: 4876/4877 is ALSO GET_SMART_TEMP_INFO (see below). Same numeric opcode,
+#   two features — check the feature context before decoding a 4876 response.
 IOTYPE_USER_GET_LULLABY_LIST_REQ        = 4876
 IOTYPE_USER_GET_LULLABY_LIST_RESP       = 4877
 
@@ -360,10 +364,13 @@ class CuboAIClient:
 
 
 # ---------------------------------------------------------------------------
-# Self-test
+# Self-test (core parsers + early builders). Defined as a function — NOT an inline
+# `if __name__ == '__main__'` block — because it sits mid-file: an inline block here would
+# run before the builders defined further down even exist. The single __main__ entry at the
+# end of the file calls this and the schedule round-trip together.
 # ---------------------------------------------------------------------------
 
-if __name__ == '__main__':
+def _selftest_core():
     # Test HWControl parse with synthetic data matching live capture values
     buf = bytearray(100)
     struct.pack_into('<iiiiiiiii', buf, 0, 0, 2, 2, 0, 0, 0, 1, 0, 0)
@@ -427,6 +434,10 @@ LULLABY_TIMER_60MIN   = 0x0e10   # 60 minute sleep timer (3600s)
 def build_set_lullaby_vol_duration(volume: int, timer: int = LULLABY_TIMER_REPEAT,
                                    correlation_id: int = 0) -> tuple[int, bytes]:
     """SET_LULLABY_VOL_DURATION_REQ (type 2438, 140 bytes).
+
+    ⚠ NAMING: emits opcode 2438, the SAME opcode as build_set_lullaby_schedule (which is an
+    RMW-from-GET variant with a different signature). Neither is build_set_lullaby_schedule_entry
+    (the alarm-clock schedule TABLE, opcode 0x0990).
 
     Confirmed struct from live capture:
       offset 0:  correlation_id (4 bytes LE)
@@ -592,6 +603,7 @@ IOTYPE_USER_GET_UPDATE_INFO_REQ         = 2400
 IOTYPE_USER_GET_UPDATE_INFO_RESP        = 2401
 
 # Light way (sunrise/sunset ambient light feature)
+# ⚠ OPCODE COLLISION: 2404/2405 is ALSO GET_LULLABY_INFO (song list, defined above).
 IOTYPE_USER_GET_LIGHT_WAY_STATUS_REQ    = 2404
 IOTYPE_USER_GET_LIGHT_WAY_STATUS_RESP   = 2405
 IOTYPE_USER_GET_LIGHT_WAY_CONFIG_REQ    = 2406
@@ -616,6 +628,7 @@ IOTYPE_USER_GET_HW_POLICY_REQ           = 4378
 IOTYPE_USER_GET_HW_POLICY_RESP          = 4379
 
 # Smart temp (wearable thermometer accessory)
+# ⚠ OPCODE COLLISION: 4876/4877 is ALSO GET_LULLABY_LIST (defined above).
 IOTYPE_USER_GET_SMART_TEMP_INFO_REQ     = 4876
 IOTYPE_USER_GET_SMART_TEMP_INFO_RESP    = 4877
 IOTYPE_USER_GET_SMART_TEMP_CONFIG_REQ   = 4880
@@ -701,6 +714,7 @@ def build_set_cry_detect(get_resp_bytes: bytes, *, enabled=None, sensitivity=Non
     The previous builder wrote enabled@4 / sensitivity@8 (the audio_filter words),
     which is why a sensitivity change was accepted-but-ignored.
     """
+    _require_get(get_resp_bytes, 40, 'build_set_cry_detect')
     payload = bytearray(40)
     payload[:40] = get_resp_bytes[:40]                  # echo full struct head raw
     struct.pack_into('<i', payload, 0, correlation_id)  # id
@@ -766,6 +780,21 @@ def _u32(raw: bytes, off: int):
 
 def _i32(raw: bytes, off: int):
     return struct.unpack_from('<i', raw, off)[0] if len(raw) >= off + 4 else None
+
+def _require_get(get_resp_bytes, min_len: int, name: str) -> None:
+    """Guard a read-modify-write SET builder against a missing/short GET echo.
+
+    RMW builders splice the raw GET response into a fixed-size payload
+    (`payload[a:b] = get_resp_bytes[c:d]`). On a short buffer that slice
+    assignment SILENTLY SHRINKS the bytearray, so the builder returns a
+    malformed / wrong-length wire message with NO error (writing device state
+    from a truncated echo presents later as a firmware quirk). Raise a clear
+    ValueError up front instead — same intent as build_set_danger_zone's guard."""
+    if get_resp_bytes is None:
+        raise ValueError(f"{name} needs the raw GET response (got None)")
+    if len(get_resp_bytes) < min_len:
+        raise ValueError(
+            f"{name} needs a >= {min_len}-byte GET response (got {len(get_resp_bytes)})")
 
 def _trim_marker(raw: bytes) -> bytes:
     """Strip the camera's 4-byte 0x1a22 'marker+timestamp' tail that rides on some
@@ -1226,6 +1255,11 @@ def parse_smart_temp_config(raw: bytes) -> dict:
 
 def parse_lullaby_schedule(raw: bytes) -> dict:
     """GET_LULLABY_SCHEDULE_RESP (2441) — authoritative lullaby timer + volume echo.
+
+    ⚠ NAMING (singular): this decodes only TIMER + VOLUME. It is NOT parse_lullaby_schedules
+    (plural — the alarm-clock schedule TABLE rows) nor parse_lullaby_schedule_action. The
+    plural 's' is the only discriminator between this and the table parser.
+
     timer_mode@8, volume@12 (live volume@12=42). The @16 word is NOT a reliable play
     flag (reads 0 while the sound is actually playing — use get_lullaby's @72 for play
     state), so it is intentionally not surfaced here."""
@@ -1577,7 +1611,13 @@ def parse_lightweight_status(raw: bytes) -> dict:
     }
 
 def parse_lullaby_schedules(raw: bytes) -> dict:
-    """GET_LULLABY_SCHEDULES_RESP (2447) — lullaby schedule table (1008 B). DECODED (offsets
+    """GET_LULLABY_SCHEDULES_RESP (2447) — lullaby schedule TABLE (the alarm-clock rows).
+
+    ⚠ NAMING (plural): the trailing 's' is the ONLY thing distinguishing this from
+    parse_lullaby_schedule (singular — just timer+volume, opcode 2441). This is the row table
+    (opcode 2447); its writer is build_set_lullaby_schedule_entry (0x0990).
+
+    lullaby schedule table (1008 B). DECODED (offsets
     confirmed live against a known schedule). Header id@0/result@4; entries at stride 100 from @8:
       enable@+0(int), name@+4(40B ASCII), uuid@+44(44B ASCII), nMDay@+88(byte day-bitmask),
       nStartHour@+89, nStartMinute@+90, nAi@+91(AI auto-play), duration@+92(int SECONDS),
@@ -1811,10 +1851,9 @@ GET_METHODS = {
 # ===========================================================================
 
 # --- extra IOTYPE codes referenced by the new builders ---
-IOTYPE_USER_SET_SPEAKER_VOLUME_REQ        = 4360
-IOTYPE_USER_SET_SPEAKER_VOLUME_RESP       = 4361
-IOTYPE_USER_SET_MIC_VOLUME_REQ            = 4376
-IOTYPE_USER_SET_MIC_VOLUME_RESP           = 4377
+# (The standalone SET_SPEAKER_VOLUME 4360/4361 and SET_MIC_VOLUME 4376/4377 IOCTLs are
+#  firmware-dead on this baby monitor — volume rides SET_HW_CONTROL — so they were removed;
+#  they were defined here but referenced nowhere.)
 IOTYPE_USER_SET_HW_POLICY_REQ             = 4380
 IOTYPE_USER_SET_HW_POLICY_RESP            = 4381
 IOTYPE_USER_IPCAM_SET_DETECTION_ZONEV2_REQ  = 2382
@@ -1855,6 +1894,7 @@ def build_set_hw_control(get_resp_bytes: bytes, *,
 
     night_vision_mode: 0=auto, 1=on (IR forced), 2=off (APK enum).
     """
+    _require_get(get_resp_bytes, 96, 'build_set_hw_control')
     hw = HWControl.parse(get_resp_bytes)
     payload = bytearray(96)
     struct.pack_into('<i', payload, 0,  hw.id)
@@ -1906,6 +1946,7 @@ def build_set_detection_zone_v2(get_resp_bytes: bytes, *,
     SET req  layout (APK toBytes): id@0, x_max@4, y_max@8, x_min@12, y_min@16,
                                    measurement@20, reserved[60].
     Coordinates are floats in [0,1]. Unchanged coords are echoed byte-for-byte."""
+    _require_get(get_resp_bytes, 28, 'build_set_detection_zone_v2')
     payload = bytearray(84)
     struct.pack_into('<i', payload, 0, correlation_id)
     payload[4:8]   = get_resp_bytes[8:12]    # x_max  (echo raw)
@@ -1941,6 +1982,7 @@ def build_set_hw_policy(get_resp_bytes: bytes, *,
     carries them as plain integers (live: 19/24 °C). We byte-faithfully echo the
     camera's own 9 config words so a same-value SET is a genuine no-op, and apply
     overrides as integers to match the observed wire encoding."""
+    _require_get(get_resp_bytes, 44, 'build_set_hw_policy')
     payload = bytearray(48)
     struct.pack_into('<i', payload, 0, correlation_id)
     payload[4:40] = get_resp_bytes[8:44]      # echo temp_alert..dev_pull_count raw
@@ -1967,6 +2009,11 @@ def build_set_auto_capture(mode: int, correlation_id: int = 0) -> tuple[int, byt
 def build_set_lullaby_schedule(volume=None, duration=None, get_resp_bytes: bytes = None,
                                correlation_id: int = 0) -> tuple[int, bytes]:
     """Set the lullaby schedule volume / sleep-timer (SET_LULLABY_VOL_DURATION, 2438).
+
+    ⚠ NAMING: despite "schedule" in the name this sets only VOLUME/TIMER. It is NOT
+    build_set_lullaby_schedule_entry (that writes the alarm-clock schedule TABLE, opcode 0x0990).
+    It emits opcode 2438 — the SAME opcode as build_set_lullaby_vol_duration, but a different
+    signature (RMW-from-GET here vs positional volume/timer there). Prefer whichever fits.
 
     The lullaby's live volume/timer is reported by GET_LULLABY_SCHEDULE (2441) @12/@8
     (see parse_lullaby_schedule) and is written by SET_LULLABY_VOL_DURATION (2438) —
@@ -2004,6 +2051,7 @@ def build_set_sleep_safety_setting(get_resp_bytes: bytes, *, safety_alert=None,
     Omitted fields are echoed from the current setting; only passed fields change.
     Delegates to build_set_sleep_safety (SET wire: id, safety_alert, cover_alert,
     safety_detection_sensitivity, baby_presence_alert — 5 ints, no reserved)."""
+    _require_get(get_resp_bytes, 24, 'build_set_sleep_safety_setting')
     cur = parse_sleep_safety_setting(get_resp_bytes)
     return build_set_sleep_safety(
         _flag(safety_alert,        cur.get('safety_alert')),
@@ -2061,9 +2109,11 @@ def parse_set_result(raw: bytes) -> dict:
 # by the (mis-named) lullaby VOLUME/timer setter (SET_LULLABY_VOL_DURATION, 2438). The
 # schedule-TABLE writer therefore uses the *_entry suffix to avoid a collision.
 #
-# UNTESTED ON THE CAMERA as of the RE date — it WRITES device state. The offline
-# round-trip below proves the encode is field-faithful; the live add/read-back/app
-# confirm is gated behind --i-understand-this-is-unsafe and an explicit go-ahead.
+# LIVE- AND APP-CONFIRMED (2026-07-10): add/delete of a single schedule row (keyed on name)
+# store exactly, and the sleep-timer duration in the SET's 8-byte tail round-trips correctly
+# once the tail-Swap transcode bug was fixed (see [[cuboai-lullaby-schedule-set]]). It WRITES
+# device state, so a live write stays gated behind --i-understand-this-is-unsafe; the offline
+# round-trip below proves the encode is field-faithful.
 # ===========================================================================
 
 IOTYPE_USER_SET_LULLABY_SCHEDULE_REQ  = 0x0990   # 2448
@@ -2295,7 +2345,74 @@ def _selftest_lullaby_schedule_roundtrip():
           "(io 0x0990, 148B, GET→SET field-faithful, DELETE + local-time paths)")
 
 
+# ===========================================================================
+# SET READ-BACK CAPABILITY REGISTRY  (audit 2026-07-23, task 5)
+# ===========================================================================
+# WHY: a SET is loss-RESILIENT (it rides _ioctl_once's retransmit-until-response loop and only
+# exits on a matching ..._RESP), but a response proves the camera ANSWERED — NOT that it APPLIED
+# the value. "accepted but not applied" is a distinct failure from "failed", and nothing in the
+# stack could tell them apart. This registry says WHICH setters can be proven applied by reading
+# the value back, and how.
+#
+# DELIBERATELY SELECTIVE — read-back is NOT blanket:
+#   * it DOUBLES command traffic when it needs its own GET, so it is opt-in per call;
+#   * many IOCTLs are ACTIONS, not state (lullaby play/stop, snapshot, reboot) — there is nothing
+#     to read back, and those are absent here rather than faked;
+#   * it must never run on the AV hot path — TUTKDirectSession.set_verified() routes its GET
+#     through get_during_stream(), which hands the request to the reader thread instead of racing
+#     the socket (and falls back to a direct ioctl when no stream is running).
+# Note the traffic cost is not uniform: the seven hw_control-backed setters verify through ONE
+# shared get_hw_control, and set_hw_control ALREADY does that GET as its read-modify-write base,
+# so for those the read-back is one extra GET regardless of how many fields changed.
+#
+# Each entry: name -> (setter_method, setter_kwarg, get_name, get_field, coerce, confidence)
+# `confidence` is deliberately explicit and must not be upgraded without evidence:
+#   'live'   = the SET->GET round-trip has been OBSERVED to agree on this camera;
+#   'static' = the pairing is inferred from the builder/parser field names only (UNCONFIRMED).
+# As shipped EVERY entry is 'static': no SET->GET round-trip has been run against the camera yet,
+# so the registry says which setters are read-back-CAPABLE, not which are read-back-PROVEN. Do not
+# upgrade an entry without a captured round-trip. (set_status_light is the sharpest reason to care:
+# the status LED is known firmware-owned on this device, so a SET may be accepted-but-not-applied —
+# exactly the case this machinery exists to surface.)
+SET_READBACK = {
+    # ── standalone on/off IOCTLs (own GET) ──
+    'night_light':      ('set_night_light',      'on',        'get_night_light',   'on',           bool, 'static'),
+    'status_light':     ('set_status_light',     'on',        'get_status_light',  'on',           bool, 'static'),
+    'light_brightness': ('set_light_brightness', 'brightness','get_light_style',   'brightness',   int,  'static'),
+    'sleep_mode':       ('set_sleep_mode',       'enabled',   'get_sleep_mode',    'enabled',      bool, 'static'),
+    'auto_capture':     ('set_auto_capture',     'mode',      'get_auto_capture',  'mode',         int,  'static'),
+    # ── detection settings (own GET) ──
+    'cry_enabled':      ('set_cry_detection',    'enabled',   'get_cry_detection', 'enabled',      bool, 'static'),
+    'cry_sensitivity':  ('set_cry_detection',    'sensitivity','get_cry_detection','sensitivity',  int,  'static'),
+    'cough_enabled':    ('set_cough_detection',  'enabled',   'get_cough_detection','enabled',     bool, 'static'),
+    'cough_sensitivity':('set_cough_detection',  'sensitivity','get_cough_detection','sensitivity',int,  'static'),
+    'cough_in_crib':    ('set_cough_detection',  'in_crib',   'get_cough_detection','in_crib_only',bool, 'static'),
+    # ── HW_CONTROL-backed setters: ALL verify through the ONE get_hw_control struct ──
+    'night_vision':     ('set_night_vision',     'mode',      'get_hw_control',    'night_vision',  int, 'static'),
+    'video_flip':       ('set_video_flip',       'on',        'get_hw_control',    'video_flip',   bool, 'static'),
+    'mic_volume':       ('set_mic_volume',       'value',     'get_hw_control',    'mic_level',     int, 'static'),
+    'speaker_volume':   ('set_speaker_volume',   'value',     'get_hw_control',    'speaker_level', int, 'static'),
+}
+
+# NO read-back capability — recorded explicitly so nothing silently claims verification.
+# ACTION = fires an effect, holds no readable state. STRUCT = state exists but the GET returns a
+# composite the registry's scalar comparison cannot honestly check (would need a field-wise
+# comparator + a wire-confirmed field map; unconfirmed, so deliberately absent).
+SET_READBACK_UNSUPPORTED = {
+    'set_lullaby':                'ACTION (starts playback; only `volume` is state — the play itself is not readable)',
+    'set_lullaby_stop':           'ACTION',
+    'set_lullaby_schedule':       'STRUCT (schedule rows; duration lives in the SET tail — GET pairing UNCONFIRMED)',
+    'set_sleep_safety':           'STRUCT (4 coupled fields; parse_sleep_safety_setting pairing UNCONFIRMED)',
+    'set_sleep_safety_setting':   'STRUCT (**kw passthrough; kwarg->GET-field map UNCONFIRMED)',
+    'set_detection_zone':         'STRUCT (normalized box; needs a field-wise comparator)',
+    'set_danger_zone':            'STRUCT (named polygon list; needs a field-wise comparator)',
+    'set_hw_control':             'STRUCT (**kw passthrough — use the per-field entries above instead)',
+}
+
+
 if __name__ == '__main__':
-    # Runs after every definition above (the legacy self-test block sits earlier in
-    # the file, before these functions exist, so the schedule round-trip lives here).
+    # Single entry point: run the core self-test (defined mid-file as _selftest_core so it
+    # doesn't execute before the later builders exist) THEN the schedule round-trip, which
+    # depends on functions defined further down.
+    _selftest_core()
     _selftest_lullaby_schedule_roundtrip()
