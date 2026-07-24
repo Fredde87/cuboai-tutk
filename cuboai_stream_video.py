@@ -426,6 +426,31 @@ def main() -> None:
         stdout.write(data)
         stdout.flush()
 
+    # ── SIGTERM → clean teardown (B-1) ────────────────────────────────────
+    # go2rtc stops an exec: source with SIGTERM (see the recipe above, killsignal=SIGTERM).
+    # Python's DEFAULT SIGTERM action terminates the process WITHOUT unwinding, so the
+    # `finally: sess.disconnect()` below — the 3x build_close session-stop burst — is skipped
+    # on every normal stream stop. Route SIGTERM into the SAME path SIGINT already takes:
+    # raise KeyboardInterrupt in the main thread so the `except (BrokenPipeError,
+    # KeyboardInterrupt)` + `finally` below run disconnect() exactly as they do for Ctrl-C.
+    #
+    # SIGINT is DELIBERATELY LEFT ALONE — Python's default handler already raises
+    # KeyboardInterrupt and unwinds cleanly (offline-proven: 3x build_close, ~30 ms), so
+    # touching it could only regress the working path. This is why the fix is just a SIGTERM
+    # alias, with none of the SIGALRM-watchdog / os._exit machinery that hung SIGINT in the
+    # first attempt. The handler is one-shot (restores SIG_DFL before raising) so a second,
+    # impatient SIGTERM hard-kills instead of re-entering teardown.
+    import signal as _signal
+
+    def _term_handler(_signum, _frame):
+        _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)   # 2nd SIGTERM → hard kill
+        raise KeyboardInterrupt                             # → except/finally → disconnect()
+
+    try:
+        _signal.signal(_signal.SIGTERM, _term_handler)
+    except (ValueError, OSError):
+        pass   # not the main thread / unsupported platform — leave the default (best-effort)
+
     try:
         if output_format == 'mpegts':
             # MPEG-TS path (Part C): carry per-frame PTS from the camera FRAMEINFO so MSE/HLS play
