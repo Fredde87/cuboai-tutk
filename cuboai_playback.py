@@ -718,7 +718,7 @@ def pull_manifest(transport, dt_utc, timeout=20.0, retries=2, diag=None, capture
             rt, data = transport.ioctl(DOWNLOAD_FILE_REQ, build_download_req(name))
         except Exception:
             # 0x910 allocates an RDT channel (heavier than a plain GET) and can TIME OUT on a busy
-            # camera or a high-latency (WiFi) link — e.g. fredde's Mac saw "no response to IOCTL
+            # camera or a high-latency (WiFi) link — e.g. the user's Mac saw "no response to IOCTL
             # 0x0910". Don't propagate (it used to crash the CLI); back off and retry, then give up
             # gracefully → ([], None). Callers treat that as "hour unavailable / unconfirmed", and
             # do_playback still ATTEMPTS the pull (playback does not hard-depend on the manifest).
@@ -1574,7 +1574,7 @@ class PlaybackSession:
         as 0 (or None/negative).
 
         The camera also returns **-1 for a target that is too FRESH** — it is still finalizing the
-        just-recorded footage into the playable store (proven by fredde's live camera: 5-min target
+        just-recorded footage into the playable store (proven by the user's live camera: 5-min target
         works first try; 3-min target succeeded on the 3rd retry; 1-min failed in 3). So retry the
         SAME target PATIENTLY (~8 tries over several seconds) — the footage becomes servable within a
         few seconds — before the caller falls back to an older target."""
@@ -1907,7 +1907,7 @@ def _selftest() -> None:
     assert hello[:4] == RDT_MAGIC and hello[4] == RDT_HELLO and hello[5] == RDT_VER
     assert hello[17] == 0x1f and len(hello) == 20
     dpkt = build_rdt_packet(RDT_DATA, seqL=3, seqH=0, conn_id=0x1f, payload=b"hello-bytes")
-    fr = build_rdt_frame(0x0e41, bytes.fromhex("000000000000"), 5, 1, dpkt)
+    fr = build_rdt_frame(0x0e41, bytes.fromhex("aabbccddeeff"), 5, 1, dpkt)
     import cuboai_pure as cp
     dec = cp.inv_transcode(fr)
     assert dec[8:12] == _RDT_FRAME_TYPE and dec[14] == 1          # frame type + channel

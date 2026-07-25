@@ -51,6 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cuboai_session import get_session   # auto-selects TUTKSession (--lib) or PureSession
 from cuboai_stream_video import apply_env_profile, _clamp_env_knobs, _env_float   # shared A/V env profile + knob clamp
+import cuboai_sensors   # public sensor API — single source for live GETs + s_log history (see cuboai_sensors.py)
 from cuboai_messages import (
     build_get_hw_control,
     build_get_light_style,
@@ -111,15 +112,12 @@ def _onoff(v):
 
 
 def _read_all(sess) -> dict:
-    """Read every GET method into {name: parsed_dict}. Failed/empty reads → None."""
-    out = {}
-    for name, (builder, resp_type, parser) in GET_METHODS.items():
-        try:
-            tc, data = sess.ioctl(*builder())
-            out[name] = parser(data) if data else None
-        except Exception:
-            out[name] = None
-    return out
+    """Read every GET method into {name: parsed_dict}. Failed/empty reads → None.
+
+    Delegates to cuboai_sensors._sweep_gets — the one place that iterates GET_METHODS, shared
+    with cuboai_sensors.get_live_sensors() so the full raw-response CLI view (this) and the
+    curated, metadata-wrapped public API (get_live_sensors) can never drift on the wire reads."""
+    return cuboai_sensors._sweep_gets(sess)
 
 
 def _row(lines: list, label: str, value) -> None:
@@ -418,15 +416,12 @@ def _render_status(d: dict) -> str:
 
 # ── Detection history (s_log) — LOCAL per-minute history, NOT a live reading ──────
 # The s_log fields are a per-minute detection/presence history (bp/na/mo/bw/be/pr + te/hu),
-# retrieved by pulling the on-camera DVR manifest over RDT (cuboai_playback). Value semantics are
-# CONFIRMED against the decompiled app (TimelinePageAdapter.getMediaFilePaint/ViewHolder): bp 1=present
-# in-view / 2=absent (bidirectional, pinned to the minute); na=noise level 0..100 (>=60 elevated);
-# mo 2=motion active; bw 1=well-being active; be 1|2=baby-event; pr 1=sleep/privacy (else recording).
-# The app's "Caregiver Present" state is NOT here — it rides a separate Region-events feed we don't
-# pull (see cuboai_playback._EVENT_KEYS note). Freshness ~1 min when the growing hour serves (settled
-# 2026-07-17); older when a pull fails. CORRECTNESS: this is HISTORY — every value carries its reading
-# time + age and the section is labelled history; a failed pull just makes the age grow (never live).
-_HIST_BP = {1: "in crib", 2: "not in crib"}   # footage-confirmed 2026-07-23
+# retrieved by pulling the on-camera DVR manifest over RDT. This section is a thin PRESENTATION
+# layer over cuboai_sensors.get_history_sensors() — the pull, retry/fallback, pacing, and
+# value->label mapping all live there now (see cuboai_sensors.py); every Reading it hands back
+# already carries its own ts/age/stale, so this file only formats. ni/nm/se/ve are intentionally
+# NOT rendered here anymore (deliberately not modelled as entities — see cuboai_sensors.py /
+# SENSORS.md); cuboai_playback.dump_history_raw_keys() remains the place to inspect them raw.
 _SPARK = "▁▂▃▄▅▆▇█"
 
 
@@ -446,112 +441,44 @@ def _sparkline(vals):
     return "".join(out)
 
 
-def pull_history_sensors(transport, hours_back=3, timeout=10):
-    """Freshest retrievable s_log record. Try the GROWING hour first (1a: it serves, ~1 min
-    lag), then fall back through completed hours if a pull fails (deterministic never_started
-    is still possible). Returns (latest MinuteRecord, hour_utc) or (None, None). Never raises."""
-    import cuboai_playback as pb, datetime as _dt
-    now = _dt.datetime.now(_dt.timezone.utc)
-    # retries=0: the flake is a camera conn_id wedge that RAPID retry only prolongs; a starve is best
-    # left to the caller's NEXT poll cycle (minutes later = a released conn_id), not hammered now.
-    for h in range(hours_back):
-        dt = now - _dt.timedelta(hours=h)
-        try:
-            recs, _ = pb.pull_manifest(transport, dt, timeout=timeout, retries=0)
-        except Exception:
-            recs = None
-        if recs:
-            return recs[-1], dt
-    return None, None
-
-
-def _render_history(rec, now_utc):
-    """Render the s_log HISTORY section — clearly separated from the live sensors above."""
-    import datetime as _dt
+def _render_history(hs) -> list:
+    """Render the s_log HISTORY section from a cuboai_sensors.HistorySensors reading — clearly
+    separated from the live sensors above. Every field is a Reading; age/staleness/labels are
+    read straight off it (cuboai_sensors did the pull + mapping, this only formats)."""
     head = "\n  🕒 Detection History (s_log — LOCAL history, NOT a live reading)"
-    if rec is None:
+    if not hs.baby_present.available:
         return [head, "    (no manifest retrievable this pull — history unavailable; "
                       "last-good ages until the next successful pull)"]
-    age = max(int(now_utc.timestamp()) - int(rec.ts), 0)
-    am, asec = divmod(age, 60)
+    ts, age = hs.baby_present.ts_utc, hs.baby_present.age_s
+    am, asec = divmod(int(age), 60)
     age_str = f"{am} min {asec:02d}s ago" if am else f"{asec}s ago"
-    loc = _dt.datetime.fromtimestamp(int(rec.ts)).astimezone()
-    utc = _dt.datetime.fromtimestamp(int(rec.ts), _dt.timezone.utc)
+    loc = ts.astimezone()
     tzhint = "" if loc.utcoffset() else "  (host TZ=UTC; camera locale ≈UTC+1 — set $TZ for true local)"
-    f = rec.flags or {}
-    L = [head, f"    as of {loc:%H:%M} local / {utc:%H:%M} UTC  —  {age_str}{tzhint}"]
-    # Field meanings CONFIRMED against live footage (2026-07-23, fredde rewatched real recordings):
-    #   bp = baby in the crib (1=in crib/visible, 2=not in crib)   na = noise level (per-minute avg)
-    #   nm = noise PEAK (caught a loud noise the avg softened)      mo = motion (0 still / 1 moving; the
-    #   app's "strong" 2 never occurred in 72h)                     ni = NIGHT-VISION / IR (1=IR/dark, 0=day)
-    #   pr = sleep/privacy (0=recording). NOTE ni & nm are real firmware sensors the APP itself never
-    #   reads (decompile: no app consumer) — surfacing them here is beyond what the official app shows.
-    #   bw = firmware ACTIVITY bit (disasm: app's ONLY use is getMediaFilePaint, where bw==1 is 1 of 4
-    #   OR-inputs that tint the tick "active"; no name/threshold/other consumer; exact trigger firmware-
-    #   internal + noisy — crying+rolling was bw=2). bw==0 (rare) ~ out-of-crib w/ carer. se=record counter,
-    #   ve=format version, be=baby-event flag (never fired in 72h here) — structural, shown raw.
-    #   NOT in s_log at all (CLOUD sleep-analysis): cough, cry, caregiver, movement, face-covered, rollover.
-    bp = f.get("bp")
-    if bp is not None:
-        L.append(f"    {'Baby in crib:':<{_W}} {_HIST_BP.get(bp, 'unknown')} (bp={bp})")
-    ni = f.get("ni")
-    if ni is not None:
-        L.append(f"    {'Night vision:':<{_W}} {'on (IR / dark)' if ni == 1 else 'off (daylight)'} (ni={ni})")
-    na = f.get("na")
-    if na is not None:
-        L.append(f"    {'Noise avg:':<{_W}} {na}{'  (≥60 = elevated)' if na >= 60 else ''}")
-    nm = f.get("nm")
-    if nm is not None:
-        L.append(f"    {'Noise peak:':<{_W}} {nm}")
-    mo = f.get("mo")
-    if mo is not None:
-        mlbl = {0: 'still', 1: 'moving'}.get(mo, f'strong ({mo})')
-        L.append(f"    {'Motion:':<{_W}} {mlbl} (mo={mo})")
-    bw = f.get("bw")
-    if bw is not None:
-        # DISASM-definitive: the app's ONLY use of bw is getMediaFilePaint (TimelinePageAdapter:643) —
-        # its sole consumer besides Room plumbing (3 total field accesses). There, bw==1 is one of four
-        # OR-inputs (be∈{1,2} OR bw==1 OR mo==2 OR na>=60) that tint the minute-tick "active" vs "calm".
-        # No name/@ColumnInfo/threshold/analytics/other consumer → bw is an OPAQUE firmware ACTIVITY bit
-        # the app just forwards into a colour. Its exact firmware trigger is unknown + noisy (footage:
-        # fires on some activity, not all — crying+rolling was bw=2). bw==0 (rare) ~ out-of-crib w/ carer.
-        desc = 'out of crib (caregiver?)' if bw == 0 else ('flagged active' if bw == 1 else 'not flagged')
-        L.append(f"    {'Activity (bw):':<{_W}} {desc} (bw={bw})  [firmware bit; app only uses it to tint the tick]")
-    pr = f.get("pr")
-    if pr is not None:
-        L.append(f"    {'Sleep/privacy:':<{_W}} {'sleep mode' if pr == 1 else 'recording'} (pr={pr})")
-    if rec.temp is not None:
-        L.append(f"    {'Temp (hist):':<{_W}} {rec.temp}°C")
-    if rec.humidity is not None:
-        L.append(f"    {'Humidity (hist):':<{_W}} {rec.humidity}%")
-    # identified but not a live sensor: be=baby-event flag (unfired in 72h here), se=per-minute record
-    # counter, ve=format version. Shown raw for completeness.
-    extra = [(k, f.get(k)) for k in ("be", "se", "ve") if f.get(k) is not None]
-    if extra:
-        L.append(f"    {'(raw be/se/ve):':<{_W}} " + " ".join(f"{k}={v}" for k, v in extra)
-                 + "  (event-flag / record counter / version)")
+    stale_note = "  [STALE — last pull failed, showing cached]" if hs.baby_present.stale else ""
+    L = [head, f"    as of {loc:%H:%M} local / {ts:%H:%M} UTC  —  {age_str}{tzhint}{stale_note}"]
+    bp = hs.baby_present
+    if bp.value is not None:
+        L.append(f"    {'Baby in crib:':<{_W}} {bp.note or 'unknown'} (bp={bp.value})")
+    na = hs.noise
+    if na.value is not None:
+        L.append(f"    {'Noise avg:':<{_W}} {na.value}{'  (' + na.note + ')' if na.note else ''}")
+    mo = hs.motion
+    if mo.value is not None:
+        L.append(f"    {'Motion:':<{_W}} {mo.note} (mo={mo.value})")
+    bw = hs.wellbeing
+    if bw.value is not None:
+        L.append(f"    {'Activity (bw):':<{_W}} bw={bw.value}  [{bw.note}]")
+    pr = hs.privacy
+    if pr.value is not None:
+        L.append(f"    {'Sleep/privacy:':<{_W}} {pr.note} (pr={pr.value})")
+    be = hs.baby_event
+    if be.value is not None:
+        L.append(f"    {'Baby event (be):':<{_W}} {be.value}  (rare; unfired in the reference 72h capture)")
+    if hs.temperature_c.value is not None:
+        L.append(f"    {'Temp (hist):':<{_W}} {hs.temperature_c.value}°C")
+    if hs.humidity_pct.value is not None:
+        L.append(f"    {'Humidity (hist):':<{_W}} {hs.humidity_pct.value}%")
     return L
-
-
-def pull_history_window(transport, hours_back=1, timeout=10):
-    """Retrieve the FULL per-minute s_log window across up to `hours_back` hours, merged + sorted
-    (minute-deduped). ONE manifest pull already carries a whole hour's minutes, so hours_back=1 is a
-    single pull (the growing hour). Older hours are paced (native ~0.5s parity) to avoid the conn_id
-    wedge. Returns list[MinuteRecord] (possibly empty); never raises."""
-    import cuboai_playback as pb, datetime as _dt, time as _t
-    now = _dt.datetime.now(_dt.timezone.utc)
-    merged = {}
-    for h in range(max(int(hours_back), 1)):
-        if h:
-            _t.sleep(0.5)                       # pace older-hour pulls (conn_id release parity)
-        dt = now - _dt.timedelta(hours=h)
-        try:
-            recs, _ = pb.pull_manifest(transport, dt, timeout=timeout, retries=0)
-        except Exception:
-            recs = None
-        for r in (recs or []):
-            merged[int(r.ts) - (int(r.ts) % 60)] = r
-    return [merged[k] for k in sorted(merged)]
 
 
 def dump_history_raw_keys(transport, hours_back=1, timeout=10):
@@ -596,35 +523,35 @@ def dump_history_raw_keys(transport, hours_back=1, timeout=10):
         print(f"    {k}: {'PRESENT' if k in rec else 'ABSENT'} in this firmware's manifests")
 
 
-def _history_series(records):
-    """The numeric s_log series worth charting → [(label, unit, [values-aligned-to-records])]."""
+def _history_series(points):
+    """The numeric s_log series worth charting → [(label, unit, [values-aligned-to-points])].
+    `points` is a cuboai_sensors.HistoryWindow.points list."""
     return [
-        ("Temp",       "°C", [r.temp for r in records]),
-        ("Humidity",   "%",  [r.humidity for r in records]),
-        ("Noise avg",  "",   [(r.flags or {}).get("na") for r in records]),
-        ("Noise peak", "",   [(r.flags or {}).get("nm") for r in records]),
+        ("Temp",      "°C", [p.temperature_c for p in points]),
+        ("Humidity",  "%",  [p.humidity_pct for p in points]),
+        ("Noise avg", "",   [p.noise for p in points]),
     ]
 
 
-def _render_history_charts(records, now_utc):
-    """Terminal ASCII sparkline per numeric s_log series over the retrieved window, with a LOCAL-time
-    axis (UTC alongside). HISTORY — the header carries the window's start/end time + reading count so
-    staleness stays visible; a chart never implies a live reading."""
-    import datetime as _dt
-    if len(records) < 2:
+def _render_history_charts(window) -> list:
+    """Terminal ASCII sparkline per numeric s_log series over a cuboai_sensors.HistoryWindow, with
+    a LOCAL-time axis (UTC alongside). HISTORY — the header carries the window's start/end time +
+    reading count so staleness stays visible; a chart never implies a live reading."""
+    points = window.points
+    if len(points) < 2:
         return []
-    ts = [int(r.ts) for r in records]
-    t0 = _dt.datetime.fromtimestamp(ts[0]).astimezone()
-    t1 = _dt.datetime.fromtimestamp(ts[-1]).astimezone()
-    u0 = _dt.datetime.fromtimestamp(ts[0], _dt.timezone.utc)
-    u1 = _dt.datetime.fromtimestamp(ts[-1], _dt.timezone.utc)
-    span_min = (ts[-1] - ts[0]) // 60 + 1
-    end_age = max(int(now_utc.timestamp()) - ts[-1], 0)
+    t0 = points[0].ts_utc.astimezone()
+    t1 = points[-1].ts_utc.astimezone()
+    u0, u1 = points[0].ts_utc, points[-1].ts_utc
+    span_min = int((u1 - u0).total_seconds()) // 60 + 1
+    end_age = int(points[-1].age_s)
+    stale_note = "  [STALE — last pull failed, showing cached]" if window.stale else ""
     L = ["\n  📈 History charts (s_log window — LOCAL history, NOT a live reading)",
          f"    window {t0:%Y-%m-%d %H:%M}→{t1:%H:%M} local  ({u0:%H:%M}→{u1:%H:%M} UTC)  ·  "
-         f"{len(records)} readings / ~{span_min} min  ·  newest {end_age//60}m{end_age%60:02d}s ago"]
+         f"{len(points)} readings / ~{span_min} min  ·  newest {end_age//60}m{end_age%60:02d}s ago"
+         f"{stale_note}"]
     any_series = False
-    for name, unit, vals in _history_series(records):
+    for name, unit, vals in _history_series(points):
         nums = [v for v in vals if v is not None]
         if not nums:
             continue
@@ -634,20 +561,21 @@ def _render_history_charts(records, now_utc):
                  f"{lo:g}–{hi:g}{unit} (last {last:g}{unit})")
     if not any_series:
         return []
-    width = len(records)
+    width = len(points)
     al, ar = f"{t0:%H:%M}", f"{t1:%H:%M}"
     pad = max(width - len(al) - len(ar), 1)
     L.append(f"    {'':<9} {al}{' ' * pad}{ar}  (local)")
     return L
 
 
-def _write_history_html(records, path, now_utc):
-    """Write a self-contained (no external deps/CDN) HTML chart of the s_log window — inline SVG line
-    charts per numeric series, LOCAL-time x-axis. Richer view of the same data as the ASCII charts."""
-    import datetime as _dt, html
-    ts = [int(r.ts) for r in records]
-    t0 = _dt.datetime.fromtimestamp(ts[0]).astimezone()
-    t1 = _dt.datetime.fromtimestamp(ts[-1]).astimezone()
+def _write_history_html(window, path):
+    """Write a self-contained (no external deps/CDN) HTML chart of a cuboai_sensors.HistoryWindow —
+    inline SVG line charts per numeric series, LOCAL-time x-axis. Richer view of the same data as
+    the ASCII charts."""
+    import html
+    points = window.points
+    t0 = points[0].ts_utc.astimezone()
+    t1 = points[-1].ts_utc.astimezone()
     W, H, PADX, PADY = 720, 140, 48, 18
     def svg(vals, unit, color):
         pts = [(i, v) for i, v in enumerate(vals) if v is not None]
@@ -667,10 +595,10 @@ def _write_history_html(records, path, now_utc):
         return (f"<svg viewBox='0 0 {W} {H}' width='100%' preserveAspectRatio='xMidYMid meet'>"
                 f"{grid}<polyline points='{poly}' fill='none' stroke='{color}' "
                 f"stroke-width='2' stroke-linejoin='round'/></svg>")
-    end_age = max(int(now_utc.timestamp()) - ts[-1], 0)
+    end_age = int(points[-1].age_s)
     blocks = []
-    for (name, unit, vals), color in zip(_history_series(records),
-                                         ("#e06c3b", "#3b82e0", "#8a3be0", "#3ba06c")):
+    for (name, unit, vals), color in zip(_history_series(points),
+                                         ("#e06c3b", "#3b82e0", "#8a3be0")):
         if not any(v is not None for v in vals):
             continue
         blocks.append(f"<section><h2>{html.escape(name)}</h2>{svg(vals, unit, color)}</section>")
@@ -688,7 +616,7 @@ def _write_history_html(records, path, now_utc):
 </style>
 <h1>CuboAI detection history (s_log)</h1>
 <p class="meta">LOCAL history — NOT a live reading. Window {t0:%Y-%m-%d %H:%M}→{t1:%H:%M} local
- ({len(records)} readings). Newest reading {end_age//60}m{end_age%60:02d}s before this file was written.</p>
+ ({len(points)} readings). Newest reading {end_age//60}m{end_age%60:02d}s before this file was written.</p>
 {''.join(blocks) or '<p>(no numeric series in this window)</p>'}
 </html>"""
     with open(path, "w", encoding="utf-8") as fh:
@@ -697,26 +625,26 @@ def _write_history_html(records, path, now_utc):
 
 def print_status(sess, history=False, history_hours=1, history_chart=None) -> None:
     """Read every GET method and print the clean CuboAI status card. When `history` (opt-in),
-    append the s_log HISTORY section + charts — an extra RDT manifest pull (~1 min lag). OPT-IN because
-    the RDT pull does NOT coexist with a live stream (Phase-3 live test: its pull fails and the
-    feed is disturbed); only run it when no stream is active."""
-    import datetime as _dt
+    append the s_log HISTORY section + charts via cuboai_sensors.get_history_sensors — an extra
+    RDT manifest pull (~1 min lag). OPT-IN because the RDT pull does NOT coexist with a live
+    stream (Phase-3 live test: its pull fails and the feed is disturbed); only run it when no
+    stream is active."""
     print(_render_status(_read_all(sess)))
     if history:
-        now_utc = _dt.datetime.now(_dt.timezone.utc)
-        records = pull_history_window(sess, hours_back=history_hours)
-        if records:
-            rec = records[-1]
+        window = cuboai_sensors.get_history_sensors(sess, window=True, window_hours=history_hours)
+        if window.points:
+            # derive the "latest reading" section from the window we already have — no 2nd pull
+            latest = cuboai_sensors.history_sensors_from_point(window.points[-1], stale=window.stale)
         else:
-            rec, _hr = pull_history_sensors(sess)   # fallback through older hours for a latest reading
-        print("\n".join(_render_history(rec, now_utc)))
-        if len(records) >= 2:
-            print("\n".join(_render_history_charts(records, now_utc)))
-        if history_chart and records:
+            latest = cuboai_sensors.get_history_sensors(sess, window=False)   # deeper hours-back search
+        print("\n".join(_render_history(latest)))
+        if len(window.points) >= 2:
+            print("\n".join(_render_history_charts(window)))
+        if history_chart and window.points:
             path = os.path.expanduser(history_chart)
             try:
-                _write_history_html(records, path, now_utc)
-                print(f"    📈 wrote chart: {path}  ({len(records)} readings)")
+                _write_history_html(window, path)
+                print(f"    📈 wrote chart: {path}  ({len(window.points)} readings)")
             except Exception as e:
                 print(f"    ⚠ chart write failed: {e}")
 
@@ -1167,7 +1095,7 @@ def do_playback(transport, args, parser):
 
     # 3) warn — CORRECTLY SCOPED (2026-07-23). Playback is PER-CLIENT, not a global camera state:
     # the camera serves DVR and live to DIFFERENT client sessions simultaneously (fredde runs DVR on
-    # his phone daily while the iPad/HA keeps streaming live, uninterrupted). So OTHER clients are NOT
+    # a phone daily while the iPad/HA keeps streaming live, uninterrupted). So OTHER clients are NOT
     # affected — the old "the nursery has NO live feed" was false. And this invocation only replaces a
     # live stream it is ITSELF rendering: with the playback flags do_playback returns BEFORE the
     # --stream-video path, so a bare rewind has no local live output to interrupt. Only warn about an
