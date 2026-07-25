@@ -263,6 +263,25 @@ with get_session(uid, account, password, camera_ip="192.0.2.10") as sess:
         ...                                       # kind is 'video' or 'audio'
 ```
 
+### Sensor API (for Home Assistant / other integrations)
+
+`cuboai_sensors.py` exposes the status card and detection-history data as two structured
+functions instead of CLI text — this is what `--status`/`--history` render on top of:
+
+```python
+import cuboai_sensors as sensors
+
+live = sensors.get_live_sensors(sess)     # instant: temp, humidity, wifi, lighting, firmware, ...
+hist = sensors.get_history_sensors(sess)  # ~1 min lag: latest s_log (baby-present, noise, motion, ...)
+
+print(live.temperature_c.value, live.temperature_c.age_s)
+print(hist.baby_present.value, hist.baby_present.note, hist.baby_present.age_s)
+```
+
+Every value is a small `Reading` object (`value`, `age_s`, `available`, `unit`, `stale`, ...) so a
+history reading can't be mistaken for a live one just by reading `.value`. See **[SENSORS.md](SENSORS.md)**
+for the full field reference, poll-cadence guidance, and what's settable vs firmware read-only.
+
 ## Files
 
 ```
@@ -274,12 +293,14 @@ cuboai_pts.py           — per-frame PTS clock + shared-base A/V timeline
 cuboai_mpegts.py        — MPEG-TS muxer (HEVC video + AAC audio)
 cuboai_playback.py      — local DVR: on-camera recording discovery, RDT manifest pull, rewind playback
 cuboai_stream_video.py  — go2rtc exec entry point: combined A/V MPEG-TS to stdout
+cuboai_sensors.py       — public sensor API (get_live_sensors / get_history_sensors) for integrations
 cuboai_validate.py      — example CLI: snapshot, record, status card, controls, DVR/history, Wi-Fi benchmark
 cuboai_tutk.py          — optional native TUTK backend (ctypes); not needed for normal use
 cubo_go2rtc.sh          — go2rtc exec wrapper script
 go2rtc.yaml             — example go2rtc stream config
 tools/cubo_pcap_decode.py — dev tool: decode a camera pcap into labelled RDT / IOCTL / AV frames
 PROTOCOL_RESEARCH.md    — how the LAN protocol works (wire formats + what we learned)
+SENSORS.md              — cuboai_sensors.py field reference, poll cadences, settable vs read-only
 ```
 
 ## Optional native backend

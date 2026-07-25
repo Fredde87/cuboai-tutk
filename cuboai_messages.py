@@ -2369,23 +2369,31 @@ def _selftest_lullaby_schedule_roundtrip():
 # `confidence` is deliberately explicit and must not be upgraded without evidence:
 #   'live'   = the SET->GET round-trip has been OBSERVED to agree on this camera;
 #   'static' = the pairing is inferred from the builder/parser field names only (UNCONFIRMED).
-# As shipped EVERY entry is 'static': no SET->GET round-trip has been run against the camera yet,
-# so the registry says which setters are read-back-CAPABLE, not which are read-back-PROVEN. Do not
-# upgrade an entry without a captured round-trip. (set_status_light is the sharpest reason to care:
-# the status LED is known firmware-owned on this device, so a SET may be accepted-but-not-applied —
-# exactly the case this machinery exists to surface.)
+# Originally EVERY entry shipped 'static': no SET->GET round-trip had been run against the camera.
+# **2026-07-25, `part3_sets.py` (small-delta live round trips, each set->verify->restore->verify):**
+# 4 entries upgraded to 'live' (see per-entry notes below) after FRAME_REGISTER.md Part 3 testing.
+# The registry says which setters are read-back-CAPABLE; do not upgrade further entries without a
+# captured round-trip. (set_status_light was the sharpest reason to care, and the live test PROVED
+# it: the status LED is firmware-owned, the SET answers result=0 but the readback DISAGREES —
+# 'live' here means "the round-trip was OBSERVED", not "the value applies". See the per-entry note.)
 SET_READBACK = {
     # ── standalone on/off IOCTLs (own GET) ──
     'night_light':      ('set_night_light',      'on',        'get_night_light',   'on',           bool, 'static'),
-    'status_light':     ('set_status_light',     'on',        'get_status_light',  'on',           bool, 'static'),
-    'light_brightness': ('set_light_brightness', 'brightness','get_light_style',   'brightness',   int,  'static'),
+    # LIVE 2026-07-25: SET answers result=0, readback DISAGREES both directions (3%->4%/restore
+    # both showed 'applied'=False for status_light in the sense that 'on' never actually flips —
+    # confirmed accepted-but-not-applied, matching the known firmware-owned status LED.
+    'status_light':     ('set_status_light',     'on',        'get_status_light',  'on',           bool, 'live'),
+    # LIVE 2026-07-25: 3%->4%->3%, both directions applied=True, byte-identical readback.
+    'light_brightness': ('set_light_brightness', 'brightness','get_light_style',   'brightness',   int,  'live'),
     'sleep_mode':       ('set_sleep_mode',       'enabled',   'get_sleep_mode',    'enabled',      bool, 'static'),
     'auto_capture':     ('set_auto_capture',     'mode',      'get_auto_capture',  'mode',         int,  'static'),
     # ── detection settings (own GET) ──
     'cry_enabled':      ('set_cry_detection',    'enabled',   'get_cry_detection', 'enabled',      bool, 'static'),
-    'cry_sensitivity':  ('set_cry_detection',    'sensitivity','get_cry_detection','sensitivity',  int,  'static'),
+    # LIVE 2026-07-25: Medium(2)->High(1)->Medium(2), both directions applied=True.
+    'cry_sensitivity':  ('set_cry_detection',    'sensitivity','get_cry_detection','sensitivity',  int,  'live'),
     'cough_enabled':    ('set_cough_detection',  'enabled',   'get_cough_detection','enabled',     bool, 'static'),
-    'cough_sensitivity':('set_cough_detection',  'sensitivity','get_cough_detection','sensitivity',int,  'static'),
+    # LIVE 2026-07-25: Medium(2)->High(1)->Medium(2), both directions applied=True.
+    'cough_sensitivity':('set_cough_detection',  'sensitivity','get_cough_detection','sensitivity',int,  'live'),
     'cough_in_crib':    ('set_cough_detection',  'in_crib',   'get_cough_detection','in_crib_only',bool, 'static'),
     # ── HW_CONTROL-backed setters: ALL verify through the ONE get_hw_control struct ──
     'night_vision':     ('set_night_vision',     'mode',      'get_hw_control',    'night_vision',  int, 'static'),
@@ -2401,9 +2409,20 @@ SET_READBACK = {
 SET_READBACK_UNSUPPORTED = {
     'set_lullaby':                'ACTION (starts playback; only `volume` is state — the play itself is not readable)',
     'set_lullaby_stop':           'ACTION',
-    'set_lullaby_schedule':       'STRUCT (schedule rows; duration lives in the SET tail — GET pairing UNCONFIRMED)',
-    'set_sleep_safety':           'STRUCT (4 coupled fields; parse_sleep_safety_setting pairing UNCONFIRMED)',
-    'set_sleep_safety_setting':   'STRUCT (**kw passthrough; kwarg->GET-field map UNCONFIRMED)',
+    'set_lullaby_schedule':       'STRUCT (schedule rows; duration lives in the SET tail — GET pairing UNCONFIRMED). '
+                                   'volume/duration kwargs MANUALLY round-tripped live 2026-07-25 (`part3_sets.py`, '
+                                   'outside this registry\'s scalar machinery) and both applied correctly.',
+    # MANUALLY round-tripped live 2026-07-25 (`part3_sets.py`) outside this registry's scalar
+    # machinery, because both are 4-coupled-field STRUCT writes it cannot honestly score alone:
+    #   sensitivity@12         APPLIES  (0->1->0, byte-exact readback both directions)
+    #   baby_presence_alert@16 DOES NOT APPLY (accepted, result=0, readback UNCHANGED both times,
+    #     confirmed NOT a swap: safety_alert/cover_alert/sensitivity all read back exactly as
+    #     expected in the same call — same accepted-but-ignored class as set_status_light).
+    # safety_alert@8 / cover_alert@12 were not touched this session (echoed unchanged, not tested).
+    'set_sleep_safety':           'STRUCT (4 coupled fields; parse_sleep_safety_setting pairing CONFIRMED for '
+                                   'sensitivity+baby_presence_alert 2026-07-25, see comment above)',
+    'set_sleep_safety_setting':   'STRUCT (**kw passthrough; kwarg->GET-field map CONFIRMED for '
+                                   'sensitivity+baby_presence_alert 2026-07-25, see comment above)',
     'set_detection_zone':         'STRUCT (normalized box; needs a field-wise comparator)',
     'set_danger_zone':            'STRUCT (named polygon list; needs a field-wise comparator)',
     'set_hw_control':             'STRUCT (**kw passthrough — use the per-field entries above instead)',
