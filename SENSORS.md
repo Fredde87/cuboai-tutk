@@ -136,25 +136,4 @@ surfacing (or at least gating on) `.age_s`/`.available`/`.stale`.
 
 "Caregiver Present" and the live cry/cough/movement *alerts* (the ones the app pushes in
 real time) are **not** in the local `s_log` manifest at all. They ride a separate Region-events
-feed that requires a Cubo cloud account and isn't pulled by this library. Don't spend time
-looking for them in `get_history_sensors()` output — they structurally aren't there.
-
-## 7 — What changed (for `niruse/cuboai` — this vintage vs. what you already integrated)
-
-Since your fork last picked up this library, three things landed:
-
-1. **DVR playback** (`cuboai_playback.PlaybackSession`) — seek/replay the camera's own
-   18–72h on-camera recording buffer, no cloud, no SD card.
-2. **Detection history** (`s_log`) — this file's `get_history_sensors()`, ~1-min-fresh
-   per-minute baby-present/noise/motion/etc., the thing your HA fork doesn't have wired up yet.
-3. Two **silent no-data bug fixes** worth knowing which vintage you're bundling, because both
-   could previously present as "go2rtc never got an answer" with no error (cf.
-   `niruse/cuboai` issue #83):
-   - `CUBOAI_IDX_SEED` (default ON) — every AV read after the *first* in a session used to emit
-     zero access units, silently, because of a per-session vs per-reader index mismatch. Hits
-     exactly the "start a stream, it works, restart it, it doesn't" shape.
-   - The SIGTERM teardown fix — a clean `disconnect()` now runs on SIGTERM (go2rtc's normal
-     stop signal), where it previously could leave state behind across a stop/restart cycle.
-
-Both are default-on, additive, and covered by `run_offline_tests.sh` — no config changes needed
-to pick them up, just the current tree.
+feed that requires a Cubo cloud account and isn't pulled by this library. 
