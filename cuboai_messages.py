@@ -6,7 +6,7 @@ against a real CuboAI camera.
 
 CONNECTION FACTS (confirmed by Frida):
   - Device UID:     license_id field from /user/cameras REST response
-  - Account:        dev_admin_id  (e.g. "admin@YOUR_ACCOUNT")
+  - Account:        dev_admin_id  (e.g. "admin@SW05C0BFBEE9C31D")
   - Password:       dev_admin_pwd
   - security_mode:  0  (NON-SECURE — camera accepts plain connections)
   - auth_type:      0
@@ -173,7 +173,7 @@ def build_get_lullaby_info() -> tuple[int, bytes]:
 @dataclass
 class HWControl:
     """SMsgAVIoctrlGetHWControlResp — 96 bytes.
-    Confirmed live: temp=31.0°C, humidity=50.0%, night_light=1, fw=3.0.1369, ssid=MyWiFi
+    Confirmed live: temp=31.0°C, humidity=50.0%, night_light=1, fw=3.0.1369, ssid=Sweden
     """
     id: int
     mic_level: int
@@ -245,11 +245,19 @@ class TempHumidity:
 
 @dataclass
 class NightLightStatus:
-    """SET_NIGHT_LIGHT_ON_OFF response — 12 bytes.
-    Confirmed: id(4) + on_off(4) + reserved(4)
+    """SET_NIGHT_LIGHT_ON_OFF_RESP — 12 bytes: id(4) + result(4) + reserved(4). The
+    universal TUTK SET-response shape (id@0, result@4) — it does NOT echo the
+    resulting on/off state. Wire-confirmed 2026-07-25 (F14): a same-value no-op SET
+    fired on a lamp known ON (via GET) returned 12 zero bytes end-to-end — id=0,
+    result=0 (success), reserved=0 — with no field distinguishing on from off. The
+    previous `on_off@4` field name/semantic was docstring-inferred and never fired
+    against a real camera; it happened to read "OFF" on every successful SET
+    regardless of the requested state, since result=0 also reads as on_off=0. Use
+    `ok` for SET success/failure; to learn the resulting state, follow up with a GET
+    (`build_get_night_light`/`_parse_onoff`, or `build_get_hw_control`/`HWControl`).
     """
     id: int
-    on_off: int   # 0=off 1=on
+    result: int
     reserved: int
 
     SIZE = 12
@@ -258,12 +266,12 @@ class NightLightStatus:
     def parse(cls, raw: bytes) -> 'NightLightStatus':
         if len(raw) < cls.SIZE:
             raise ValueError(f"NightLightStatus too short: {len(raw)} < {cls.SIZE}")
-        id_, on_off, reserved = struct.unpack_from('<III', raw, 0)
-        return cls(id_, on_off, reserved)
+        id_, result, reserved = struct.unpack_from('<III', raw, 0)
+        return cls(id_, result, reserved)
 
     @property
-    def is_on(self) -> bool:
-        return self.on_off == 1
+    def ok(self) -> bool:
+        return self.result == 0
 
 
 @dataclass
@@ -346,6 +354,27 @@ class CuboAIClient:
             raise ValueError(f"Unexpected response type {resp_type}")
         return LullabyVolDuration.parse(data)
 
+    def get_lullaby_schedule(self) -> dict:
+        """GET_LULLABY_SCHEDULE (2440) — the camera's lullaby volume + sleep-timer echo.
+
+        The ONLY readable source for the lullaby volume and timer: GET_LULLABY_VOL_DURATION
+        (2436) carries the current song and play state but NOT the volume (see parse_lullaby's
+        explicit `'volume': None`), and the write (SET_LULLABY_VOL_DURATION, 2438) is a coupled
+        struct that needs this echo to preserve whichever field a caller leaves alone.
+
+        This wrapper was missing while the builder, the RESP constant and parse_lullaby_schedule
+        all existed and were registered in GET_METHODS — so a consumer calling it (niruse's HA
+        coordinator did, on every poll) got AttributeError, and with the call inside a broad
+        except that degraded silently to a hardcoded volume for months.
+
+        Returns parse_lullaby_schedule's dict: `volume`, `timer_mode` (seconds: 0 = repeat,
+        1800 = 30 min, 3600 = 60 min) and `timer` (its label).
+        """
+        resp_type, data = self.transport.ioctl(*build_get_lullaby_schedule())
+        if resp_type != IOTYPE_USER_GET_LULLABY_SCHEDULE_RESP:
+            raise ValueError(f"Unexpected response type {resp_type}")
+        return parse_lullaby_schedule(data)
+
     def set_night_light(self, on: bool) -> NightLightStatus:
         resp_type, data = self.transport.ioctl(*build_set_night_light(on))
         if resp_type != IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_RESP:
@@ -376,20 +405,22 @@ def _selftest_core():
     struct.pack_into('<iiiiiiiii', buf, 0, 0, 2, 2, 0, 0, 0, 1, 0, 0)
     struct.pack_into('<ff', buf, 36, 31.0, 50.0)
     buf[44:53] = b'3.0.1369'
-    buf[56:62] = b'MyWiFi'
+    buf[56:62] = b'Sweden'
     struct.pack_into('<iiiiii', buf, 72, 87, 0, 0, 0, 0, 0)
     hw = HWControl.parse(bytes(buf))
     assert abs(hw.temperature - 31.0) < 1e-5
     assert abs(hw.humidity - 50.0) < 1e-5
     assert hw.night_light_on
     assert hw.fw_version == '3.0.1369'
-    assert hw.ssid == 'MyWiFi'
+    assert hw.ssid == 'Sweden'
     print(f"HWControl OK: {hw.temperature}°C {hw.humidity}% NL={'ON' if hw.night_light_on else 'OFF'}")
 
-    # Test NightLightStatus
-    nl = NightLightStatus.parse(struct.pack('<III', 42, 1, 0))
-    assert nl.is_on
-    print(f"NightLightStatus OK: on={nl.is_on}")
+    # Test NightLightStatus (F14: SET response is {id, result, reserved} — no state echo)
+    nl = NightLightStatus.parse(struct.pack('<III', 42, 0, 0))
+    assert nl.ok
+    nl_fail = NightLightStatus.parse(struct.pack('<III', 42, 1, 0))
+    assert not nl_fail.ok
+    print(f"NightLightStatus OK: result={nl.result} ok={nl.ok}")
 
     # Test LullabyVolDuration
     buf2 = bytearray(204)
@@ -1422,7 +1453,7 @@ def parse_event_list(raw: bytes) -> dict:
 def parse_wifi(raw: bytes) -> dict:
     """GET_WIFI_RESP (2319) — current Wi-Fi association. Carries the SSID (@8), the
     camera's LAN IP, and the camera's MAC as null-terminated ASCII tokens. Live:
-    ssid 'MyWiFi', ip '192.0.2.10', mac 'aa:bb:cc:dd:ee:ff'."""
+    ssid 'Sweden', ip '192.168.1.178', mac 'c0:bf:be:e9:c3:1d'."""
     import re
     toks = _ascii_tokens(raw, minlen=2, limit=20)
     ip = next((t for t in toks if re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}', t)), None)
@@ -1730,19 +1761,66 @@ def parse_feature_support(raw: bytes) -> dict:
     return d
 
 
+def _json_span(raw: bytes):
+    """Byte span of the FIRST complete {...} object in `raw`, or None.
+
+    Brace-counted, and string-aware so a brace inside a JSON string value does not
+    close the object. These responses are binary IOCTL blobs with the JSON embedded:
+    the trailing bytes are counters and padding, and a greedy first-{ to last-} match
+    spans past the real object as soon as any stray 0x7D ('}') lands among them, so
+    json.loads fails and the whole response is discarded. Because those bytes are
+    counters, whether it happens varies call to call — LIVE 2026-09-03 it cost
+    `get_session_stats` roughly one call in three (measured on the HA integration's
+    60s poll: 200 dropouts in 12h, each exactly one poll long, on a `mode` that never
+    actually changed).
+    """
+    start = raw.find(b'{')
+    if start < 0:
+        return None
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(raw)):
+        ch = raw[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == 0x5C:        # backslash
+                esc = True
+            elif ch == 0x22:        # closing quote
+                in_str = False
+            continue
+        if ch == 0x22:
+            in_str = True
+        elif ch == 0x7B:            # {
+            depth += 1
+        elif ch == 0x7D:            # }
+            depth -= 1
+            if depth == 0:
+                return start, i + 1
+    return None                     # truncated: no matching close brace
+
+
 def _extract_json(raw: bytes):
     """Pull the first {...} object out of a response blob, repairing the camera's bare
     (unquoted) dotted-quad IP values so json.loads accepts it. Returns dict or None."""
     import re, json
+
+    def _load(chunk: bytes):
+        txt = chunk.decode('latin1', 'replace')
+        txt = re.sub(r':\s*(\d{1,3}(?:\.\d{1,3}){3})\s*([,}\]])', r': "\1"\2', txt)  # quote bare IPs
+        try:
+            return json.loads(txt)
+        except Exception:
+            return None
+
+    span = _json_span(raw)
+    if span:
+        obj = _load(raw[span[0]:span[1]])
+        if obj is not None:
+            return obj
+    # Fall back to the historical greedy match so this can only ever parse MORE
+    # responses than before, never fewer.
     m = re.search(rb'\{.*\}', raw, re.S)
-    if not m:
-        return None
-    txt = m.group(0).decode('latin1', 'replace')
-    txt = re.sub(r':\s*(\d{1,3}(?:\.\d{1,3}){3})\s*([,}\]])', r': "\1"\2', txt)  # quote bare IPs
-    try:
-        return json.loads(txt)
-    except Exception:
-        return None
+    return _load(m.group(0)) if m else None
 
 def parse_session_stats(raw: bytes) -> dict:
     """GET_SESSION_STATS_RESP (0x0935) — UNDOCUMENTED. The camera's own per-session
