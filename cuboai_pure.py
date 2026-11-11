@@ -3472,12 +3472,27 @@ class TUTKDirectSession:
             g = math.ceil(self._rtt_ewma * au_rate) + 1
             return max(self._MSG_GRACE, min(self._grace_max, g))
 
+        # ⚠ REGRESSION SWITCH: OFF (=0) reopens the live frag-seq wrap drop (5th u16 instance, the live
+        # twin of PlaybackReader._frag_sorted / CUBOAI_PB_WRAP). An AU whose fragments straddle frag-seq
+        # 65535->0 sorted as (0,1,..,65535): assembled from a MIDDLE chunk, failed the start-code test,
+        # was classed a system frame and dropped with every counter clean. Pre-wrap == sorted().
+        _fwrap = os.environ.get("CUBOAI_FRAG_WRAP", "1") != "0"
+
+        def fsort(fm):
+            if not _fwrap or not fm:
+                return sorted(fm)
+            k0 = next(iter(fm))
+            return sorted(fm, key=lambda k: ((k - k0 + 0x8000) & 0xFFFF) - 0x8000)
+
+        def fspan(ks):                       # number of frag-seqs first..last inclusive (modular)
+            return (((ks[-1] - ks[0]) & 0xFFFF) + 1) if _fwrap else (ks[-1] - ks[0] + 1)
+
         def assemble(frag_map):
             # Concatenate a message's fragments in fragment-seq order, NOT arrival order:
             # a retransmitted fragment arrives late (after later fragments) and must still
             # land in its correct position, or the NAL bytes scramble and the picture fails
             # to decode. The dict keys also dedupe retransmits.
-            return b"".join(frag_map[k] for k in sorted(frag_map))
+            return b"".join(frag_map[k] for k in fsort(frag_map))
 
         def is_marker(p):
             # First fragment of every access unit starts with an AV marker: the HEVC
@@ -3494,8 +3509,8 @@ class TUTKDirectSession:
         def kf_complete(fm):
             # KF-grace: a keyframe's fragments are consecutive frag-seqs; complete = no
             # interior gap (misses a trailing-frag loss, the minority case).
-            ks = sorted(fm)
-            return bool(ks) and (ks[-1] - ks[0] + 1) == len(ks)
+            ks = fsort(fm)
+            return bool(ks) and fspan(ks) == len(ks)
 
         def classify(b):
             if b[:4] == b"\x00\x00\x00\x01":
@@ -3528,14 +3543,14 @@ class TUTKDirectSession:
             # in-order (NODROP) and the legacy seal paths. lag = hi-m at emit (latency proxy, AU-idx).
             nonlocal video_frame_count
             if self._truncate_partial:
-                _ks = sorted(fm)
-                if (_ks and (_ks[-1] - _ks[0] + 1) != len(_ks)
+                _ks = fsort(fm)
+                if (_ks and fspan(_ks) != len(_ks)
                         and fm[_ks[0]][:4] == b"\x00\x00\x00\x01"):
                     # C1 clean-truncation: contiguous prefix up to the first hole (no bridge).
                     _pref = []; _exp = _ks[0]
                     for _k in _ks:
                         if _k != _exp: break
-                        _pref.append(fm[_k]); _exp += 1
+                        _pref.append(fm[_k]); _exp = (_exp + 1) & 0xFFFF if _fwrap else _exp + 1
                     unit = b"".join(_pref)
                 else:
                     unit = assemble(fm)
@@ -3544,8 +3559,8 @@ class TUTKDirectSession:
             au_times.append(time.time())             # FIX#5: feed the live AU-rate
             if len(au_times) > 128:
                 del au_times[0]
-            ks = sorted(fm)                                       # frag-seqs (hoisted: au_log + FRAMEINFO strip)
-            comp = bool(ks) and (ks[-1] - ks[0] + 1) == len(ks)   # contiguous fragments == COMPLETE AU
+            ks = fsort(fm)                                        # frag-seqs (hoisted: au_log + FRAMEINFO strip)
+            comp = bool(ks) and fspan(ks) == len(ks)              # contiguous fragments == COMPLETE AU
             # Audio investigation (Phase 2): gated codec/FRAMEINFO census, emitted at the EARLIEST
             # point a full AU exists — before audio-truncation, video-FRAMEINFO-strip, or the
             # consumer's kind filter. One stderr line per AU. Gated (default OFF) => byte-identical.
@@ -3827,8 +3842,9 @@ class TUTKDirectSession:
                                 # straggler can still belong to m) is DONE -> emit NOW, no grace wait.
                                 if self._emit_complete:
                                     if fm is not None and (m + 1) in msgs:
-                                        a = sorted(fm)
-                                        if (a[-1] - a[0] + 1) == len(a) and a[-1] + 1 == min(msgs[m + 1]) \
+                                        a = fsort(fm)
+                                        if fspan(a) == len(a) and (((a[-1] + 1) & 0xFFFF) == fsort(msgs[m + 1])[0]
+                                                                   if _fwrap else a[-1] + 1 == min(msgs[m + 1])) \
                                                 and is_marker(fm[a[0]]):
                                             seal_one(m, msgs.pop(m), hi - m); done_upto = m; kf_idxs.discard(m)
                                             continue
