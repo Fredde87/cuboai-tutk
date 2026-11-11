@@ -249,6 +249,7 @@ def mux_timed_stream(frames_timed, emit, *, clean_gop=True, mux_audio=False, log
     """
     from cuboai_pts import AVTimeline
     from cuboai_mpegts import TSMuxer
+    from cuboai_pure import detect_video_codec
 
     def _nal_kf(au):
         return (len(au) >= 5 and au[:4] == b'\x00\x00\x00\x01'
@@ -279,7 +280,9 @@ def mux_timed_stream(frames_timed, emit, *, clean_gop=True, mux_audio=False, log
         if kind != 'video':
             continue
         if mux is None:
-            codec = (fi or {}).get('codec', 'hevc')
+            codec = (fi or {}).get('codec') or detect_video_codec(data, default=None)
+            if not codec:
+                continue                              # P-only AU, no FRAMEINFO: wait, don't guess
             mux = TSMuxer(codec=codec, audio_codec=('aac' if mux_audio else None))
             log(f"[mpegts] muxing {codec}{'+aac' if mux_audio else ''} → MPEG-TS with FRAMEINFO PTS "
                 f"(stream_type=0x{mux.stream_type:02x})")
