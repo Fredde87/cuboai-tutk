@@ -1162,7 +1162,6 @@ class PlaybackReader:
         self.done_upto = -1     # highest msg-index emitted/skipped
         self.stale = 0          # frames dropped as modularly-behind duplicates (wrapfix only)
         self.frag_hi = None     # highest frag-seq [46:48] seen (for channel-N ACK C/D)
-        self.frag_prev = 0xFFFF
         self.frames = 0         # channel-N fragments fed
         self.frames_video = 0   # video AUs emitted
         self.frames_audio = 0   # audio AUs emitted
@@ -1624,7 +1623,7 @@ class PlaybackSession:
         cp = self.cp; inner = self.inner; s = inner._sock
         reader = self.reader; N = self.channel
         last_open = 0.0; last_ack0 = 0.0; last_ackN = 0.0; last_nak = 0.0
-        frag_prev = 0xFFFF; engaged = False
+        engaged = False
         while not self._stop_evt.is_set():
             now = time.time()
             if not engaged and now - last_open > self.reopen_interval:
@@ -1640,11 +1639,18 @@ class PlaybackSession:
                     C, D, sack = reader.compute_channel_sack(self._hole_req, 0.15)
                     if sack: self.stats['resend_req'] += len(sack)
                 else:
-                    C, D, sack = frag_prev, reader.frag_hi, None
+                    # Held-edge (non-SACK) ACK: C = highest CONTIGUOUS frag received (mirrors
+                    # compute_channel_sack's own C, minus the SACK list), NOT a stale echo of a
+                    # previous D — a `frag_prev = D`-style lag can itself desync from the real
+                    # contiguous edge, and seeding it 0xFFFF poisoned the very first ACK
+                    # (C=0xFFFF far above D — the wire-proven-harmful pattern). Same degenerate
+                    # fallback as compute_channel_sack: nothing contiguous known yet -> C=D.
+                    C = ((reader.frag_una - 1) & 0xFFFF) if reader.frag_una is not None else reader.frag_hi
+                    D, sack = reader.frag_hi, None
                 try:                              # channel-N ACK uses channel N's OWN counters
                     s.sendto(build_channel_ack(inner, N, C, D, sack=sack, seq=self._seq_N,
                              relseq=self._relseq_N, ackord=self._ackord_N), inner._cam)
-                    self._seq_N += 1; self._relseq_N += 1; self._ackord_N += 1; frag_prev = D
+                    self._seq_N += 1; self._relseq_N += 1; self._ackord_N += 1
                 except Exception: pass
                 last_ackN = now
             # ARM retransmit: echo the session ms-clock in the 0x0b/0x0a pair (THE arming
