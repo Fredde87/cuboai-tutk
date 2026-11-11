@@ -1560,7 +1560,7 @@ def main():
             try:
                 n = transport.send_audio_file(args.talk, loop=args.talk_loop,
                                               max_secs=args.talk_secs, on_status=_talk_status,
-                                              gain=args.talk_gain)
+                                              gain=args.talk_gain, grant_timeout=20)
                 print(f"   ✅ Talk done ({n} audio frames)")
             except KeyboardInterrupt:
                 transport.stop_audio()

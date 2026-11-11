@@ -1544,6 +1544,18 @@ def build_resend_b(R, seq, recv_count, ts=None):
 _TALK_GRANT_CAP_DEFAULT = b"\xe0\xfe\xfe\x01"   # 4.3.x capability word; fallback if connect() didn't capture it
 
 
+class TalkTimeout(RuntimeError):
+    """send_audio_file gave up because the camera never logged into the talk channel within
+    `grant_timeout` seconds of SPEAKERSTART (busy, another talker, refusing). Same name/shape as the
+    niruse/cuboai vendored copy (v2.6.44, 9cff4e0) so the two stay in sync. `.reason` == 'grant';
+    `.sent` is the number of audio frames sent (always 0 for 'grant')."""
+
+    def __init__(self, reason, sent=0):
+        super().__init__(f"talk timeout: {reason}")
+        self.reason = reason
+        self.sent = sent
+
+
 def _aac_units(path, rate=16000, gain=1.0):
     """Transcode any audio file -> a list of AAC-LC ADTS frames via PyAV (no ffmpeg binary — same
     dependency as snapshot/record; stays ffmpeg-agnostic). Each frame is self-describing (7-byte
@@ -4277,7 +4289,7 @@ class TUTKDirectSession:
 
     # ── two-way audio (talk-to-baby) ──────────────────────────────────────────
     def send_audio_file(self, path, channel=1, loop=False, max_secs=None, rate=16000,
-                        warmup=2.5, on_status=None, gain=1.0):
+                        warmup=2.5, on_status=None, gain=1.0, grant_timeout=None):
         """Talk: play an audio file out the camera speaker (pure-Python two-way audio, no native lib).
 
         Talk is the av-connect handshake REVERSED on a separate channel: we open an av-SERVER, the
@@ -4300,6 +4312,10 @@ class TUTKDirectSession:
           rate      AAC sample rate to transcode to (camera expects 16 kHz mono).
           warmup    seconds of live stream before SPEAKERSTART (camera must be in LiveStreamState).
           on_status optional callback(dict) for progress (sent, delivered, decoding) — for a CLI/UI.
+          grant_timeout  raise TalkTimeout('grant') if the camera has not logged into the talk
+                    channel this many seconds after SPEAKERSTART. None (default) = wait forever —
+                    a refused talk then runs until max_secs / stop_audio(), SILENTLY (no frames, no
+                    status, just ACKs). SPEAKERSTOP is still sent on the way out (finally:).
           gain      linear volume multiplier (1.0 = unchanged, <1 quieter, >1 louder) — the reliable
                     talk-volume lever, since the camera's speaker_level is firmware-managed.
         """
@@ -4329,6 +4345,7 @@ class TUTKDirectSession:
             time.sleep(0.02)
 
         spk_sent = grant_sent = False
+        spk_at = None                        # when SPEAKERSTART went out (grant_timeout counts from it)
         cam_react = 0
         audio_i = 0                          # index into units[] — WRAPS on loop (the audio content)
         talk_frag = 0                        # MONOTONIC frag-seq / message-index — never wraps with the
@@ -4363,11 +4380,15 @@ class TUTKDirectSession:
                     try: self._send_ack()
                     except Exception: pass
                     last_ack = now
+                if (grant_timeout is not None and spk_sent and not grant_sent
+                        and now - spk_at > grant_timeout):
+                    raise TalkTimeout('grant', talk_frag)        # no talk-login: camera is not taking it
                 if not spk_sent and now - t0 > warmup:           # SPEAKERSTART {channel}
                     pl = struct.pack('<I', channel) + bytes([0, 0, 0, 0])
                     s.sendto(build_ioctl_data(R, self._seq, self._relseq, self._frmno, 0x0350, pl), cam)
                     self._seq += 1; self._relseq += 1; self._frmno += 1
                     spk_sent = True
+                    spk_at = now
                 # Pump audio on an ABSOLUTE 64ms grid (advance next_audio by period, never reset to now).
                 if grant_sent and cam_react > 0:
                     if next_audio is None:

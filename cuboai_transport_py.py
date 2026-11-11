@@ -293,7 +293,7 @@ class PureSession:
 
     def send_audio_file(self, path: str, channel: int = 1, loop: bool = False,
                         max_secs=None, rate: int = 16000, warmup: float = 2.5, on_status=None,
-                        gain: float = 1.0):
+                        gain: float = 1.0, grant_timeout=None):
         """Talk: play an audio file out the camera speaker (pure-Python two-way audio, no native lib).
 
         Opens an av-server on a reversed-role talk channel; the camera logs in and pulls AAC-LC audio.
@@ -302,7 +302,8 @@ class PureSession:
         optional progress callback. Returns frames delivered.
         """
         return self._inner.send_audio_file(path, channel=channel, loop=loop, max_secs=max_secs,
-                                           rate=rate, warmup=warmup, on_status=on_status, gain=gain)
+                                           rate=rate, warmup=warmup, on_status=on_status, gain=gain,
+                                           grant_timeout=grant_timeout)
 
     def stop_audio(self):
         """Ask an in-flight (e.g. looping) send_audio_file to stop at the next tick."""
