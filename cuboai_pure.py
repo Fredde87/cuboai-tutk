@@ -2157,7 +2157,12 @@ class TUTKDirectSession:
         # with NO AU dequeued AND NO AV fragment received (the AND keeps a survivable recovery hold
         # from tripping it). Engine default 0 = OFF (byte-identical); the streamer profile turns it on.
         self._stall_s = max(0.0, _env_float_pure("CUBOAI_STALL_S", 0.0))
-        self._last_av_rx = None         # wall time of the last AV fragment (reader thread stamps it)
+        # Until THIS read has seen its first AV fragment the allowance is the larger
+        # CUBOAI_FIRST_AU_S (default 20 s): video only starts after the deferred 0x0300 (~5 s) and a
+        # slow first keyframe must not be cut at STALL_S and respawned in an endless loop.
+        self._first_au_s = max(self._stall_s, _env_float_pure("CUBOAI_FIRST_AU_S", 20.0))
+        self._last_av_rx = None         # time.monotonic() of the last AV fragment (reader stamps it);
+                                        # monotonic so an NTP step / VM resume cannot fake a silence
         self._stat_stalls = 0           # generators ended by the silence gate
         self._stat_holes = 0            # distinct fragments detected missing (first resend-request)
         self._stat_resend_req = 0       # resend requests SENT (SACK entries, incl. re-asks)
@@ -3147,7 +3152,7 @@ class TUTKDirectSession:
             't': time.time(),
             # silence visibility (R-1): seconds since the last AV fragment (None = none yet) — the
             # one field that names a dead-silent session, which every rate/ratio below hides.
-            'rx_age_s': (round(time.time() - _lr, 3) if _lr is not None else None),
+            'rx_age_s': (round(time.monotonic() - _lr, 3) if _lr is not None else None),
             'stalls': self._stat_stalls,
             # fragments / wire loss
             'frags_recv': recv,
@@ -3784,7 +3789,7 @@ class TUTKDirectSession:
                     if self._idx_modular:                 # H1: lift the u16 index into done_upto's
                         idx = _unwrap_index(idx, done_upto)  # space so the gate survives the wrap
                     frag = struct.unpack("<H", dec[46:48])[0]
-                    self._last_av_rx = time.time()        # silence gate + rx_age_s (stamp only)
+                    self._last_av_rx = time.monotonic()   # silence gate + rx_age_s (stamp only)
                     avlen = struct.unpack("<H", dec[52:54])[0]
                     chunk = bytes(dec[64:64 + max(0, avlen)])
                     nframes += 1                       # S62 verbose: camera AV fragment counter
@@ -3944,7 +3949,7 @@ class TUTKDirectSession:
 
         emitted = 0
         t0 = time.time()
-        last_item = t0                         # silence gate: last AU dequeued (or generator start)
+        t0m = last_item = time.monotonic()     # silence gate: last AU dequeued (or generator start)
         try:
             while True:
                 if timeout is not None and time.time() - t0 >= timeout:
@@ -3958,15 +3963,17 @@ class TUTKDirectSession:
                         return
                     if self._stall_s:
                         _rx = self._last_av_rx
-                        _quiet = time.time() - max(last_item, _rx if _rx is not None else 0.0)
-                        if _quiet >= self._stall_s:
+                        _started = _rx is not None and _rx >= t0m     # a fragment in THIS read
+                        _limit = self._stall_s if _started else self._first_au_s
+                        _quiet = time.monotonic() - max(last_item, _rx if _started else 0.0)
+                        if _quiet >= _limit:
                             self._stat_stalls += 1
                             print(f"[stall] no AV fragment and no AU for {_quiet:.1f}s "
-                                  f"(CUBOAI_STALL_S={self._stall_s:g}) — ending the stream",
-                                  file=sys.stderr, flush=True)
+                                  f"({'CUBOAI_STALL_S' if _started else 'CUBOAI_FIRST_AU_S'}={_limit:g})"
+                                  f" — ending the stream", file=sys.stderr, flush=True)
                             return
                     continue
-                last_item = time.time()
+                last_item = time.monotonic()
                 if item is None:               # reader ended
                     return
                 yield item
