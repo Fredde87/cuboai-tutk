@@ -490,6 +490,14 @@ def get_history_sensors(sess, *, hours_back=3, window=False, window_hours=1, tim
     if _pace_allows(cache, _HIST_CACHE_LATEST_GATE, min_pull_interval_s):
         rec, _hr = _pull_latest_record(sess, hours_back, timeout)
         if rec is not None:
+            # NEWEST RECORD WINS (ported from niruse/cuboai b7e4b8a, live-verified there). A transient
+            # growing-hour failure makes _pull_latest_record fall back to the tail of a COMPLETED
+            # hour — a "successful" pull of a record OLDER than the cached one (20 min old at :20
+            # past). Served as fresh it reported 20-min-old presence as current and overwrote the
+            # newer cache. Re-serve the newer cached record, marked stale (its age keeps growing).
+            cached = cache.get(_HIST_CACHE_LATEST)
+            if cached is not None and int(cached.ts) > int(rec.ts):
+                return _history_sensors_from_record(cached, now, stale=True)
             cache[_HIST_CACHE_LATEST] = rec
             return _history_sensors_from_record(rec, now, stale=False)
     cached = cache.get(_HIST_CACHE_LATEST)
