@@ -284,6 +284,7 @@ def get_live_sensors(sess, *, cache: Optional[dict] = None) -> LiveSensors:
 # surfaces and are intentionally NOT exposed here (see SENSORS.md) — don't add them as entities.
 
 _HIST_CACHE_LATEST = "history_latest_record"
+_HIST_CACHE_LATEST_OLDER = '_hist_latest_older_ts'   # ts of the last rejected older record (progress test)
 _HIST_CACHE_LATEST_GATE = "history_latest_pull_gate"
 _HIST_CACHE_WINDOW = "history_window_records"
 _HIST_CACHE_WINDOW_GATE = "history_window_pull_gate"
@@ -495,9 +496,23 @@ def get_history_sensors(sess, *, hours_back=3, window=False, window_hours=1, tim
             # hour — a "successful" pull of a record OLDER than the cached one (20 min old at :20
             # past). Served as fresh it reported 20-min-old presence as current and overwrote the
             # newer cache. Re-serve the newer cached record, marked stale (its age keeps growing).
+            #
+            # ...but ONLY while the older record is not ADVANCING. A completed-hour fallback returns
+            # the same tail record on every retry; if successive "older" records keep moving forward
+            # the camera has simply moved on and its clock stepped back relative to the cached record
+            # (NTP fix after a reboot, DST). Without this the cache stayed pinned for the whole step
+            # (2 h reproduced) with age clamped to 0, so no freshness cutoff could expire it.
             cached = cache.get(_HIST_CACHE_LATEST)
             if cached is not None and int(cached.ts) > int(rec.ts):
-                return _history_sensors_from_record(cached, now, stale=True)
+                # "advancing" = moved forward by no more than the time that really passed between
+                # the two pulls (+2 min slack). A fallback landing on a DIFFERENT completed hour
+                # (H-2, then H-1) jumps ~3600 s in one poll and is still a fallback, not progress.
+                last_older = cache.get(_HIST_CACHE_LATEST_OLDER)
+                cache[_HIST_CACHE_LATEST_OLDER] = (int(rec.ts), now.timestamp())
+                step = (int(rec.ts) - last_older[0]) if last_older else 0
+                if not (last_older and 0 < step <= (now.timestamp() - last_older[1]) + 120):
+                    return _history_sensors_from_record(cached, now, stale=True)
+            cache.pop(_HIST_CACHE_LATEST_OLDER, None)
             cache[_HIST_CACHE_LATEST] = rec
             return _history_sensors_from_record(rec, now, stale=False)
     cached = cache.get(_HIST_CACHE_LATEST)
