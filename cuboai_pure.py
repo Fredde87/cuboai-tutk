@@ -549,6 +549,34 @@ def _iter_nal_headers(au: bytes):
         else:
             i += 1
 
+
+def _iter_nal_header_pairs(au: bytes):
+    """Yield (byte0, byte1-or-None) of every Annex-B NAL header in `au` — byte1 is the second byte
+    of HEVC's 2-byte header (nuh_layer_id low bits + nuh_temporal_id_plus1)."""
+    n, i = len(au), 0
+    while i < n - 2:
+        if au[i] == 0 and au[i + 1] == 0 and au[i + 2] == 1:
+            j = i + 3
+        elif (au[i] == 0 and au[i + 1] == 0 and i + 3 < n
+              and au[i + 2] == 0 and au[i + 3] == 1):
+            j = i + 4
+        else:
+            i += 1
+            continue
+        if j < n:
+            yield au[j], (au[j + 1] if j + 1 < n else None)
+        i = j
+
+
+def _hevc_hdr_ok(b0: int, b1) -> bool:
+    """True if (b0, b1) is a valid single-layer HEVC NAL header: forbidden bit 0, nuh_layer_id 0
+    (b0 bit0 and b1's top 5 bits), nuh_temporal_id_plus1 != 0. H.264 cannot alias this: every odd
+    H.264 type (1 slice, 5 IDR, 7 SPS, 9 AUD) sets b0 bit0, an SPS's b1 is profile_idc (>= 66), and a
+    first slice / PPS b1 starts with ue(0) = 1 (>= 0x80). Without this check the 1-byte reading
+    aliased: x264's P-slice 0x41 == HEVC VPS (32), HEVC IDR_N_LP 0x28 == H.264 PPS (8)."""
+    return b1 is not None and not (b0 & 0x81) and (b1 >> 3) == 0 and (b1 & 0x07) != 0
+
+
 def detect_video_codec(au: bytes, default: str = "hevc") -> str:
     """Return 'hevc' or 'h264' for an Annex-B access unit.
 
@@ -560,16 +588,17 @@ def detect_video_codec(au: bytes, default: str = "hevc") -> str:
     P-frame-only AU with no parameter set — detection is normally done on a keyframe.
     """
     h264_idr = hevc_pic = None
-    for b in _iter_nal_headers(au):
+    for b, b1 in _iter_nal_header_pairs(au):
         if b & 0x80:                                   # forbidden bit set
             continue
-        if (b & 0x1F) in (7, 8):                       # H.264 SPS / PPS — decisive
+        hv = _hevc_hdr_ok(b, b1)                       # read each NAL as ONE codec, never both
+        if not hv and (b & 0x1F) in (7, 8):            # H.264 SPS / PPS — decisive
             return "h264"
-        if ((b >> 1) & 0x3F) in (32, 33, 34):          # HEVC VPS/SPS/PPS — decisive
+        if hv and ((b >> 1) & 0x3F) in (32, 33, 34):   # HEVC VPS/SPS/PPS — decisive
             return "hevc"
-        if h264_idr is None and (b & 0x1F) == 5:       # H.264 IDR slice
+        if h264_idr is None and not hv and (b & 0x1F) == 5:        # H.264 IDR slice
             h264_idr = True
-        if hevc_pic is None and ((b >> 1) & 0x3F) in (19, 20, 21):  # HEVC IDR/CRA
+        if hevc_pic is None and hv and ((b >> 1) & 0x3F) in (19, 20, 21):  # HEVC IDR/CRA
             hevc_pic = True
     if hevc_pic:
         return "hevc"
@@ -621,14 +650,15 @@ def _is_video_keyframe(unit: bytes, codec: str) -> bool:
     HEVC keyframes carry VPS/SPS/PPS (types 32/34) or an IDR/CRA picture (19-21);
     H.264 keyframes carry an SPS (7)/PPS (8) or an IDR slice (5). Scans all NALs so a
     leading access-unit-delimiter/SEI doesn't hide the keyframe."""
-    for b in _iter_nal_headers(unit):
+    for b, b1 in _iter_nal_header_pairs(unit):
         if b & 0x80:
             continue
+        hv = _hevc_hdr_ok(b, b1)                       # same one-codec-per-NAL rule as the sniffer
         if codec == "hevc":
-            if ((b >> 1) & 0x3F) in (32, 33, 34, 19, 20, 21):
+            if hv and ((b >> 1) & 0x3F) in (32, 33, 34, 19, 20, 21):
                 return True
         else:
-            if (b & 0x1F) in (7, 8, 5):
+            if not hv and (b & 0x1F) in (7, 8, 5):
                 return True
     return False
 
