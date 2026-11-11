@@ -1808,7 +1808,15 @@ def mux_playback_stream(pbsess, writer, duration=None, idle_timeout=3.0,
         return (len(au) >= 5 and au[:4] == b'\x00\x00\x00\x01'
                 and ((au[4] >> 1) & 0x3f) in (32, 33, 34, 19, 20, 21))
     tl = cuboai_pts.AVTimeline()
-    mux = cuboai_mpegts.TSMuxer(codec='hevc', audio_codec='aac')
+    # Built at the first video AU whose codec is KNOWN (FRAMEINFO, else the NAL sniff) — NOT
+    # hard-coded: an H.264 camera (niruse's is one) announced as HEVC (0x24) gives go2rtc no
+    # parameter sets and NO video track, so playback "opens and shows nothing" (niruse 857cc5b).
+    # AUs that precede it (audio, and unclassifiable P-only video) are HELD with the PTS/now
+    # computed on arrival and flushed in order once the muxer exists, so an HEVC recording's TS
+    # output is byte-identical to the old eager construction (test_playback_codec.py pins it).
+    from cuboai_pure import detect_video_codec
+    mux = None
+    _held = []                                         # [(kind, unit, p, now_ms)] before the muxer
     _log = log or (lambda *a: None)
     t0 = time.time(); last_au = t0; nv = na = 0; kf = 0
     v_ts_n = 0                                         # count of recorded video AUs carrying a ts_sec
@@ -1829,6 +1837,26 @@ def mux_playback_stream(pbsess, writer, duration=None, idle_timeout=3.0,
         try:
             if kind == 'video':
                 p = tl.video(info, nal_keyframe=_nal_kf(unit))
+                if mux is None:
+                    codec = (info or {}).get('codec') if isinstance(info, dict) else None
+                    if codec not in ('h264', 'hevc'):
+                        codec = detect_video_codec(unit, default=None)
+                    if codec is None:                  # P-only AU, no FRAMEINFO: hold, don't guess
+                        if len(_held) < 512:
+                            _held.append(('video', unit, p, now))
+                        continue
+                    mux = cuboai_mpegts.TSMuxer(codec=codec, audio_codec='aac')
+                    _log(f"[mpegts] playback muxing {codec}+aac")
+                    for _k, _u, _p, _now in _held:     # flush in arrival order
+                        if _k == 'video':
+                            writer.write(mux.mux_au(_u, _p['pts_90k'], keyframe=_p['keyframe'], now_ms=_now))
+                            if raw_video_writer is not None:
+                                raw_video_writer.write(_u)
+                            nv += 1
+                            if _p['keyframe']: kf += 1
+                        else:
+                            writer.write(mux.mux_audio_au(_u, _p['pts_90k'], now_ms=_now)); na += 1
+                    _held = []
                 writer.write(mux.mux_au(unit, p['pts_90k'], keyframe=p['keyframe'], now_ms=now))
                 if raw_video_writer is not None:
                     raw_video_writer.write(unit)       # diagnostic tee: raw Annex-B AUs
@@ -1840,6 +1868,10 @@ def mux_playback_stream(pbsess, writer, duration=None, idle_timeout=3.0,
                     v_hi = ts if v_hi is None else max(v_hi, ts)
             elif kind == 'audio':
                 p = tl.audio(info)
+                if mux is None:
+                    if len(_held) < 512:               # bounded: no classifiable video, ever
+                        _held.append(('audio', unit, p, now))
+                    continue
                 writer.write(mux.mux_audio_au(unit, p['pts_90k'], now_ms=now))
                 na += 1
         except Exception as e:
