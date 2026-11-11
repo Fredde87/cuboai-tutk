@@ -194,9 +194,9 @@ def _load_redirect_shim(camera_ip: str) -> None:
         # so our oracle runs are unchanged and no host process is ever replaced.
         _ar = os.environ.get('CUBOAI_ALLOW_REEXEC')
         if _ar is None:
-            _main = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ''
-            _ar = '1' if (_main.endswith('.py') and os.path.dirname(_main)
-                          == os.path.dirname(os.path.abspath(__file__))) else '0'
+            _main = os.path.realpath(sys.argv[0]) if sys.argv and sys.argv[0] else ''   # realpath: a
+            _ar = '1' if (_main.endswith('.py') and os.path.dirname(_main)                 # symlinked rig is still ours
+                          == os.path.dirname(os.path.realpath(__file__))) else '0'
         if _ar != '1':
             print("[cuboai_tutk] redirect shim NOT loaded: re-exec would replace the host process "
                   "(set CUBOAI_ALLOW_REEXEC=1 for a standalone script). Native connects only where "
