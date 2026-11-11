@@ -1748,6 +1748,15 @@ class _StreamGet:
         self.result = None
 
 
+class _IoctlUnanswered(TimeoutError):
+    """_ioctl_once got no response. `.alive` — the camera was still sending us datagrams, so the
+    session is fine and only this request went unanswered (slow or unsupported opcode)."""
+
+    def __init__(self, msg, alive=False):
+        super().__init__(msg)
+        self.alive = alive
+
+
 def _env_float_pure(name, default):
     try:
         return float(os.environ.get(name, "") or default)
@@ -2156,6 +2165,12 @@ class TUTKDirectSession:
         # so the session looked alive). CUBOAI_STALL_S>0 ends _read_av_units after that many seconds
         # with NO AU dequeued AND NO AV fragment received (the AND keeps a survivable recovery hold
         # from tripping it). Engine default 0 = OFF (byte-identical); the streamer profile turns it on.
+        # IOCTL on a LIVE session (live finding 2026-11-11, fw 3.0.1426): GET_LIGHTWEIGHT_STATUS takes
+        # the camera 1.1-3.3+ s (other GETs 30-260 ms) while ACKs keep flowing. The old hard 3.0 s
+        # timeout + disconnect/reconnect made it a coin flip that churned sessions. While the camera
+        # is alive, wait up to this many seconds on the SAME session. 0 = legacy behaviour.
+        self._ioctl_alive_wait = max(0.0, _env_float_pure("CUBOAI_IOCTL_ALIVE_WAIT", 8.0))
+        self._stat_ioctl_unanswered_alive = 0   # timeouts on a live session (no reconnect done)
         self._stall_s = max(0.0, _env_float_pure("CUBOAI_STALL_S", 0.0))
         # Until THIS read has seen its first AV fragment the allowance is the larger
         # CUBOAI_FIRST_AU_S (default 20 s): video only starts after the deferred 0x0300 (~5 s) and a
@@ -2949,6 +2964,11 @@ class TUTKDirectSession:
     def ioctl(self, type_code, payload, timeout_ms=5000):
         """Send an AV IOCTL and return (response_type_code, response_bytes).
 
+        TIMING (timeout_ms is accepted for API compatibility and NOT used): a SILENT session gets
+        3.0 s per attempt, then disconnect + reconnect, up to 3 attempts. A LIVE session (the
+        camera keeps sending ACKs/keepalives) is given CUBOAI_IOCTL_ALIVE_WAIT seconds (default 8)
+        on the SAME session and is never torn down for one unanswered request.
+
         Pure Python over the LAN data channel (no native library): builds the
         0x0407 DATA frame carrying <io_type><payload>, sends it to the camera P2P
         port, ACKs the camera's reliable stream while waiting, and returns the
@@ -3009,16 +3029,28 @@ class TUTKDirectSession:
                     time.sleep(0.2)
                     continue
             try:
-                return self._ioctl_once(type_code, payload, timeout=3.0)
+                return self._ioctl_once(type_code, payload, timeout=3.0,
+                                        alive_wait=self._ioctl_alive_wait)
             except TimeoutError as e:
                 self._stat_ioctl_timeout += 1
                 last_err = str(e)
-                self.disconnect()           # reconnect for the retry
+                if self._ioctl_alive_wait and getattr(e, "alive", False):
+                    # The camera is ALIVE (ACKs/keepalives kept arriving) and simply did not answer
+                    # this opcode in time. Reconnecting cannot help — it discards a late answer and
+                    # restarts the camera's own wait (live 2026-11-11: 3 reconnects, then failure) —
+                    # so report the timeout and KEEP the session for the caller's next request.
+                    self._stat_ioctl_unanswered_alive += 1
+                    raise TimeoutError(f"IOCTL 0x{type_code:04x} failed after retries: {last_err} "
+                                       f"(session alive — not reconnecting)")
+                self.disconnect()           # silent session: reconnect for the retry
                 time.sleep(0.2)
         raise TimeoutError(
             f"IOCTL 0x{type_code:04x} failed after retries: {last_err}")
 
-    def _ioctl_once(self, type_code, payload, timeout=3.0):
+    def _ioctl_once(self, type_code, payload, timeout=3.0, alive_wait=0.0):
+        """One request/response exchange. `timeout` is how long a SILENT session is given.
+        `alive_wait` (>timeout) is how long we keep waiting while the camera is demonstrably
+        alive — any datagram from it in the last 1.5 s. Raises _IoctlUnanswered (alive=True/False)."""
         import select
         s = self._sock
         resp_type = type_code | 1                       # GET req even -> resp = req+1
@@ -3033,7 +3065,15 @@ class TUTKDirectSession:
         self._stat_tx_ioctl += 1
         t0 = time.time()
         last_tx = t0
-        while time.time() - t0 < timeout:
+        last_rx = None                                  # last datagram of ANY kind from the camera
+        while True:
+            now = time.time()
+            if now - t0 >= timeout:
+                # past the silent-session budget: only a camera that is still talking to us earns
+                # more time (a slow answer on a live session — see ioctl()).
+                if not (alive_wait > timeout and last_rx is not None and now - last_rx <= 1.5
+                        and now - t0 < alive_wait):
+                    break
             r, _, _ = select.select([s], [], [], 0.05)
             now = time.time()
             if now - last_tx > 0.4:                     # retransmit (same relseq/frmno, new pkt seq)
@@ -3053,6 +3093,7 @@ class TUTKDirectSession:
                 raw, addr = s.recvfrom(4096)
             except BlockingIOError:
                 continue
+            last_rx = time.time()
             if len(raw) < 16:
                 continue
             if is_keepalive_probe(raw):                 # answer liveness probe (session-31)
@@ -3076,7 +3117,8 @@ class TUTKDirectSession:
                     return resp_type, bytes(dec[68:end])
             elif sub in (0x09, 0x0A):
                 self._send_ack()                        # respond to ack/NAK probes
-        raise TimeoutError(f"no response to IOCTL 0x{type_code:04x}")
+        _alive = last_rx is not None and time.time() - last_rx <= 1.5
+        raise _IoctlUnanswered(f"no response to IOCTL 0x{type_code:04x}", alive=_alive)
 
     # ── high-level GET commands ───────────────────────────────────────────────
     # Thin wrappers over ioctl(): each builds the request with the cuboai_messages
@@ -3166,6 +3208,7 @@ class TUTKDirectSession:
             # one field that names a dead-silent session, which every rate/ratio below hides.
             'rx_age_s': (round(time.monotonic() - _lr, 3) if _lr is not None else None),
             'stalls': self._stat_stalls,
+            'ioctl_unanswered_alive': self._stat_ioctl_unanswered_alive,
             # fragments / wire loss
             'frags_recv': recv,
             'frags_lost': holes,
