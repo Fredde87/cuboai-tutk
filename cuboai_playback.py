@@ -1810,9 +1810,6 @@ def mux_playback_stream(pbsess, writer, duration=None, idle_timeout=3.0,
     set (external interrupt, e.g. a SIGINT handler). Returns a stats dict. The caller owns
     pbsess.start()/close() (so live is always restored)."""
     import cuboai_pts, cuboai_mpegts
-    def _nal_kf(au):                                    # same NAL keyframe test as the live streamer
-        return (len(au) >= 5 and au[:4] == b'\x00\x00\x00\x01'
-                and ((au[4] >> 1) & 0x3f) in (32, 33, 34, 19, 20, 21))
     tl = cuboai_pts.AVTimeline()
     # Built at the first video AU whose codec is KNOWN (FRAMEINFO, else the NAL sniff) — NOT
     # hard-coded: an H.264 camera (niruse's is one) announced as HEVC (0x24) gives go2rtc no
@@ -1820,8 +1817,13 @@ def mux_playback_stream(pbsess, writer, duration=None, idle_timeout=3.0,
     # AUs that precede it (audio, and unclassifiable P-only video) are HELD with the PTS/now
     # computed on arrival and flushed in order once the muxer exists, so an HEVC recording's TS
     # output is byte-identical to the old eager construction (test_playback_codec.py pins it).
-    from cuboai_pure import detect_video_codec
+    # Keyframes: DVR replay leaves the FRAMEINFO keyframe bit UNSET (niruse 3e5cda7), so the NAL test
+    # is the only signal there — and it must be codec-aware (the old 1-byte HEVC test saw no H.264
+    # IDR, and read x264's 0x41 P-slice as an HEVC VPS). keyframe = FRAMEINFO bit OR NAL keyframe:
+    # identical when the bit is set, adds the TS random-access indicator on IDRs when it is not.
+    from cuboai_pure import detect_video_codec, _is_video_keyframe
     mux = None
+    vcodec = None
     _held = []                                         # [(kind, unit, p, now_ms)] before the muxer
     _log = log or (lambda *a: None)
     t0 = time.time(); last_au = t0; nv = na = 0; kf = 0
@@ -1842,15 +1844,21 @@ def mux_playback_stream(pbsess, writer, duration=None, idle_timeout=3.0,
         now = int(time.time() * 1000)
         try:
             if kind == 'video':
-                p = tl.video(info, nal_keyframe=_nal_kf(unit))
-                if mux is None:
+                if vcodec is None:
                     codec = (info or {}).get('codec') if isinstance(info, dict) else None
                     if codec not in ('h264', 'hevc'):
                         codec = detect_video_codec(unit, default=None)
-                    if codec is None:                  # P-only AU, no FRAMEINFO: hold, don't guess
+                    vcodec = codec
+                nkf = _is_video_keyframe(unit, vcodec) if vcodec else False
+                p = tl.video(info, nal_keyframe=nkf)
+                if nkf and not p['keyframe']:
+                    p = dict(p, keyframe=True)         # FRAMEINFO bit unset (DVR): trust the NAL
+                if mux is None:
+                    if vcodec is None:                 # P-only AU, no FRAMEINFO: hold, don't guess
                         if len(_held) < 512:
                             _held.append(('video', unit, p, now))
                         continue
+                    codec = vcodec
                     mux = cuboai_mpegts.TSMuxer(codec=codec, audio_codec='aac')
                     _log(f"[mpegts] playback muxing {codec}+aac")
                     for _k, _u, _p, _now in _held:     # flush in arrival order
