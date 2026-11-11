@@ -186,6 +186,22 @@ def _load_redirect_shim(camera_ip: str) -> None:
             return
 
         import sys
+        # SAFETY: os.execve REPLACES THE WHOLE PROCESS and re-runs sys.argv. Fine for our own
+        # standalone scripts; fatal for an EMBEDDER (Home Assistant imports this module — niruse
+        # ca78ea8 hit exactly this; a notebook / someone else's script would restart in place).
+        # CUBOAI_ALLOW_REEXEC=1/0 forces it (same knob as the niruse/cuboai copy). Default: only
+        # when the running script lives in THIS module's directory (every cuboai_*/wo_*/s65_* rig),
+        # so our oracle runs are unchanged and no host process is ever replaced.
+        _ar = os.environ.get('CUBOAI_ALLOW_REEXEC')
+        if _ar is None:
+            _main = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ''
+            _ar = '1' if (_main.endswith('.py') and os.path.dirname(_main)
+                          == os.path.dirname(os.path.abspath(__file__))) else '0'
+        if _ar != '1':
+            print("[cuboai_tutk] redirect shim NOT loaded: re-exec would replace the host process "
+                  "(set CUBOAI_ALLOW_REEXEC=1 for a standalone script). Native connects only where "
+                  "LAN broadcast reaches the camera.", file=sys.stderr, flush=True)
+            return
         env = os.environ.copy()
         existing = env.get('LD_PRELOAD', '')
         env['LD_PRELOAD'] = (SHIM_PATH + ':' + existing).strip(':')
