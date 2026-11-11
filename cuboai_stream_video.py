@@ -82,6 +82,7 @@ PRODUCTION_ENV = {
     'CUBOAI_RECOVERY_HOLD':    '24',       # hold a present-incomplete AU ~1s to catch a late resend
     'CUBOAI_CLEAN_GOP':        '1',        # mpegts path: emit only complete AUs, resync at IDR
     'CUBOAI_MUX_AUDIO':        '1',        # mux interleaved AAC into the TS (combined A/V by default)
+    'CUBOAI_STALL_S':          '10',       # R-1: end the stream after 10 s of total camera silence
 }
 
 # --raw / --passthrough: the historical byte-for-byte Annex-B passthrough. Forces the OUTPUT
@@ -472,6 +473,17 @@ def main() -> None:
         pass
     except Exception as e:
         print(f"Stream error: {e}", file=sys.stderr)
+    else:
+        # The generator ended by itself. With the silence gate that means the camera went quiet
+        # for good (R-1): exit NON-ZERO so go2rtc treats the producer as failed and respawns it,
+        # instead of holding a dead pipe open with consumers starving.
+        try:
+            if sess.get_stats().get('stalls'):
+                print("[stall] camera session went silent — exiting 1 so go2rtc respawns",
+                      file=sys.stderr, flush=True)
+                sys.exit(1)                  # finally: below still disconnects
+        except AttributeError:
+            pass
     finally:
         if _v_stop is not None:
             _v_stop.set()
