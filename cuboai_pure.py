@@ -1748,6 +1748,29 @@ class _StreamGet:
         self.result = None
 
 
+def _strip_av_ext(dec):
+    """Normalise a camera DATA frame (sub 0x0C) that carries the 8-byte header EXTENSION.
+
+    Found 2026-11-12 on real traffic: when byte[29] has bit 0x08 set, an extra 8-byte block sits at
+    [36:44] and every later header field is shifted by 8 — frag-seq at [54:56] not [46:48],
+    payload length at [60:62] not [52:54], payload at [72:] not [64:]. These are ordinary,
+    in-sequence A/V fragments (~1.4 % of all fragments, one every ~0.6 s). Read with the standard
+    offsets they looked like junk with a "wild" frag-seq (the unrelated counter that lands at
+    [46:48]), so the reader dropped them as out-of-band and then asked the camera to resend data it
+    had already delivered; and when the real frag-seq came within 256 below that counter the ACK
+    high-water jumped to it, inventing ~256 holes at once (the t~60 s burst, once per frag wrap).
+
+    Returns the frame with the block removed and bit 0x08 cleared, so every downstream parser sees
+    a standard frame. Only frames that fit the extended layout EXACTLY (length == 72 + the payload
+    length at [60:62]) are touched; anything else is returned unchanged."""
+    if len(dec) >= 76 and dec[28] == 0x0C and (dec[29] & 0x08):
+        if struct.unpack_from("<H", dec, 60)[0] == len(dec) - 72:
+            out = bytearray(dec[:36] + dec[44:])
+            out[29] &= 0xF7
+            return bytes(out)
+    return dec
+
+
 class _IoctlUnanswered(TimeoutError):
     """_ioctl_once got no response. `.alive` — the camera was still sending us datagrams, so the
     session is fine and only this request went unanswered (slow or unsupported opcode)."""
@@ -2179,6 +2202,10 @@ class TUTKDirectSession:
         self._last_av_rx = None         # time.monotonic() of the last AV fragment (reader stamps it);
                                         # monotonic so an NTP step / VM resume cannot fake a silence
         self._stat_stalls = 0           # generators ended by the silence gate
+        # ⚠ BEHAVIOUR SWITCH, default OFF in this release candidate (byte-identical to rc4): parse
+        # the 8-byte header extension instead of discarding those fragments. See _strip_av_ext.
+        self._av_ext = os.environ.get("CUBOAI_AV_EXT", "0") != "0"
+        self._stat_av_ext = 0           # extension fragments seen (counted in BOTH modes)
         self._reader_error = None       # exception that killed the reader thread, if any
         self._stat_holes = 0            # distinct fragments detected missing (first resend-request)
         self._stat_resend_req = 0       # resend requests SENT (SACK entries, incl. re-asks)
@@ -3210,6 +3237,8 @@ class TUTKDirectSession:
             'rx_age_s': (round(time.monotonic() - _lr, 3) if _lr is not None else None),
             'stalls': self._stat_stalls,
             'ioctl_unanswered_alive': self._stat_ioctl_unanswered_alive,
+            'av_ext_frames': self._stat_av_ext,
+            'av_ext_parsed': self._av_ext,
             # fragments / wire loss
             'frags_recv': recv,
             'frags_lost': holes,
@@ -3831,6 +3860,10 @@ class TUTKDirectSession:
                     dec = inv_transcode(raw)
                     if len(dec) < 40:
                         continue
+                    if len(dec) >= 76 and dec[28] == 0x0C and (dec[29] & 0x08):
+                        self._stat_av_ext += 1                 # visible even when not parsed
+                        if self._av_ext:
+                            dec = _strip_av_ext(dec)
                     if dec[28] != 0x0C or len(dec) < 68:
                         # S86: capture the camera's ms-clock from cam->host 0x0a [36:38]
                         # so _send_nak can echo it in our 0x0b (THE arming discriminator).
