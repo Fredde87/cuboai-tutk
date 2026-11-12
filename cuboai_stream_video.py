@@ -202,6 +202,7 @@ def _verbose_loop(sess, interval, camera_stats, stop):
                 f"{d['bitrate_kbps'] / 1000.0:.1f}Mbps | loss {d['loss_pct']:.1f}% "
                 f"recov {cur['recovery_pct']:.0f}% (req {d['resend_req']} rec {d['recovery_events']}) | "
                 f"gap {cur['gap_now']} (max {cur['gap_max']}, capjmp {cur['gap_cap_jumps']}) | "
+                f"fec {cur.get('fec_recovered', 0)} resync {cur.get('resyncs', 0)} | "
                 f"incAU {d['au_incomplete']} kf {d['kf_incomplete']}/{d['kf_total']} | "
                 f"ts garbage {gpct:.0f}% regress {cur['ts_regress']}")
         # SILENT-RECOVERY VISIBILITY (audit 2026-07-23). ioctl()'s auto-reconnect masked the

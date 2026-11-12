@@ -1172,7 +1172,7 @@ class PlaybackReader:
         self.req_frags = set()       # frag-seqs we've SACK-requested (for the honor-rate metric)
         self.honored = 0             # requested frags that subsequently ARRIVED (armed-resend proof)
         self.sub2 = 0                # secondary-substream frags skipped (byte[29] & 0x08 — see feed())
-        self._av_ext = _os.environ.get("CUBOAI_AV_EXT", "0") != "0"
+        self._av_ext = _os.environ.get("CUBOAI_AV_EXT", "1") != "0"
         self.ext_parsed = 0          # byte[29]&0x08 fragments parsed as A/V (CUBOAI_AV_EXT=1)
         import cuboai_pure as _cp
         self._strip_av_ext = _cp._strip_av_ext
@@ -1185,7 +1185,7 @@ class PlaybackReader:
         if dec[14] != self.channel:
             return                                  # not our playback channel — ignore (live etc.)
         if self._av_ext and (dec[29] & 0x08):
-            # CUBOAI_AV_EXT (default OFF): byte[29]&0x08 is an 8-byte header EXTENSION at [36:44]
+            # CUBOAI_AV_EXT (default ON since v1.1.0-rc8; =0 restores the old drop): byte[29]&0x08 is an 8-byte header EXTENSION at [36:44]
             # (the camera's 0x0a timing record riding on a data fragment), not a second sub-stream —
             # proven on LIVE traffic 2026-11-12 (see cuboai_pure._strip_av_ext). The "far band
             # ~5120+" below is what the standard offsets read when every field is shifted by 8
