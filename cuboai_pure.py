@@ -2179,6 +2179,7 @@ class TUTKDirectSession:
         self._last_av_rx = None         # time.monotonic() of the last AV fragment (reader stamps it);
                                         # monotonic so an NTP step / VM resume cannot fake a silence
         self._stat_stalls = 0           # generators ended by the silence gate
+        self._reader_error = None       # exception that killed the reader thread, if any
         self._stat_holes = 0            # distinct fragments detected missing (first resend-request)
         self._stat_resend_req = 0       # resend requests SENT (SACK entries, incl. re-asks)
         self._stat_resend_recovered = 0 # distinct requested holes that arrived (resend honoured)
@@ -3730,60 +3731,79 @@ class TUTKDirectSession:
 
         try:
             while not stop_evt.is_set():
-                r, _, _ = select.select([s], [], [], 0.04)
-                maybe_ack()                        # rate-limited (~10/s) periodic ACK
-                maybe_nak()                        # S54: resend_mode gap NAK (no-op if off)
-                # S81: send the deferred 0x0300 (stream-start) ~_MID_IOCTL_SECS after
-                # stream-open, matching native (0x0300 @~5 s, reliable-seq ~68). Purely
-                # time-based: 0x0300 is the trigger that starts video, so there are no
-                # frames to count before it. Sent here on the reader thread (sole sender)
-                # -> no seq race. Video begins flowing only after this fires. Skipped
-                # when defer_stream_start is off (then 0x0300 went up front; mid_ioctl_
-                # sent is already True). When 0x01FF is NOT deferred but 0x0300 IS, the
-                # 0x01FF rides immediately after 0x0300 here (it must not precede it).
-                if self._defer_stream_start and not mid_ioctl_sent \
-                        and time.time() - t_stream0 >= self._MID_IOCTL_SECS:
-                    self._send_video_start_mid()
-                    mid_ioctl_sent = True
-                    t_mid = time.time()
-                    self._vlog(f"[stream] deferred 0x0300 (stream-start) sent  "
-                               f"(t={t_mid - t_stream0:.1f}s)")
-                    if not self._defer_video_start_late and not late_ioctl_sent:
+                try:
+                    r, _, _ = select.select([s], [], [], 0.04)
+                except (ValueError, OSError):
+                    # the socket was closed under us (teardown racing this thread): select() on a
+                    # closed fd raises ValueError. Leave quietly if we are stopping; otherwise idle
+                    # and let the silence gate end the stream.
+                    if stop_evt.is_set():
+                        break
+                    self._stat_tx_err += 1
+                    time.sleep(0.04)
+                    continue
+                # Every send this tick is guarded: a network outage makes sendto() raise
+                # (macOS EADDRNOTAVAIL "Can't assign requested address" when Wi-Fi drops, Linux
+                # ENETUNREACH/ENETDOWN, EBADF on a socket closed under us at shutdown). Unguarded,
+                # that killed this thread: the stream ended at once, "cleanly", with no stall
+                # recorded (live 2026-11-11). Count it and carry on — if the outage lasts, the
+                # silence gate ends the stream; if it does not, the stream simply resumes.
+                try:
+                    maybe_ack()                        # rate-limited (~10/s) periodic ACK
+                    maybe_nak()                        # S54: resend_mode gap NAK (no-op if off)
+                    # S81: send the deferred 0x0300 (stream-start) ~_MID_IOCTL_SECS after
+                    # stream-open, matching native (0x0300 @~5 s, reliable-seq ~68). Purely
+                    # time-based: 0x0300 is the trigger that starts video, so there are no
+                    # frames to count before it. Sent here on the reader thread (sole sender)
+                    # -> no seq race. Video begins flowing only after this fires. Skipped
+                    # when defer_stream_start is off (then 0x0300 went up front; mid_ioctl_
+                    # sent is already True). When 0x01FF is NOT deferred but 0x0300 IS, the
+                    # 0x01FF rides immediately after 0x0300 here (it must not precede it).
+                    if self._defer_stream_start and not mid_ioctl_sent \
+                            and time.time() - t_stream0 >= self._MID_IOCTL_SECS:
+                        self._send_video_start_mid()
+                        mid_ioctl_sent = True
+                        t_mid = time.time()
+                        self._vlog(f"[stream] deferred 0x0300 (stream-start) sent  "
+                                   f"(t={t_mid - t_stream0:.1f}s)")
+                        if not self._defer_video_start_late and not late_ioctl_sent:
+                            self._send_video_start_late()
+                            late_ioctl_sent = True
+                            self._vlog("[stream] 0x01FF sent (rides 0x0300; defer off)")
+                    # S71/S81: then 0x01FF ~_LATE_IOCTL_SECS AFTER 0x0300 once video flows
+                    # (after _LATE_IOCTL_FRAMES video units OR _LATE_IOCTL_SECS since 0x0300),
+                    # matching native's ~5-s spacing. Gated on defer_video_start_late AND on
+                    # 0x0300 having been sent so the timer measures from stream-start, not
+                    # connect. The time cap fires even when video is sparse, so a stream that
+                    # needs 0x01FF can never deadlock.
+                    if self._defer_video_start_late and not late_ioctl_sent and mid_ioctl_sent and (
+                            video_frame_count >= self._LATE_IOCTL_FRAMES
+                            or time.time() - t_mid >= self._LATE_IOCTL_SECS):
                         self._send_video_start_late()
                         late_ioctl_sent = True
-                        self._vlog("[stream] 0x01FF sent (rides 0x0300; defer off)")
-                # S71/S81: then 0x01FF ~_LATE_IOCTL_SECS AFTER 0x0300 once video flows
-                # (after _LATE_IOCTL_FRAMES video units OR _LATE_IOCTL_SECS since 0x0300),
-                # matching native's ~5-s spacing. Gated on defer_video_start_late AND on
-                # 0x0300 having been sent so the timer measures from stream-start, not
-                # connect. The time cap fires even when video is sparse, so a stream that
-                # needs 0x01FF can never deadlock.
-                if self._defer_video_start_late and not late_ioctl_sent and mid_ioctl_sent and (
-                        video_frame_count >= self._LATE_IOCTL_FRAMES
-                        or time.time() - t_mid >= self._LATE_IOCTL_SECS):
-                    self._send_video_start_late()
-                    late_ioctl_sent = True
-                    self._vlog(f"[stream] deferred 0x01FF sent  "
-                               f"(video_frame_count={video_frame_count}, "
-                               f"t={time.time() - t_stream0:.1f}s)")
-                # Mid-stream GET injection (benchmark/verbose telemetry): the reader is the
-                # SOLE socket sender during a stream, so a requested GET is sent here and its
-                # response captured in the recv path below. Inert when nothing is pending
-                # (self._get_inject is None), so the default stream stays byte-identical.
-                gi = self._get_inject
-                if gi is not None and not gi.done.is_set():
-                    now2 = time.time()
-                    if not gi.sent or now2 - gi.last_tx > 0.4:   # initial send / retransmit
-                        self._sock.sendto(
-                            build_ioctl_data(self._R, self._seq, self._relseq,
-                                             self._frmno, gi.io_type, gi.payload),
-                            self._cam)
-                        self._seq += 1                           # every (re)tx burns one pkt seq
-                        if not gi.sent:                          # the request reliable-seq/FrmNo once
-                            self._relseq += 1
-                            self._frmno += 1
-                            gi.sent = True
-                        gi.last_tx = now2
+                        self._vlog(f"[stream] deferred 0x01FF sent  "
+                                   f"(video_frame_count={video_frame_count}, "
+                                   f"t={time.time() - t_stream0:.1f}s)")
+                    # Mid-stream GET injection (benchmark/verbose telemetry): the reader is the
+                    # SOLE socket sender during a stream, so a requested GET is sent here and its
+                    # response captured in the recv path below. Inert when nothing is pending
+                    # (self._get_inject is None), so the default stream stays byte-identical.
+                    gi = self._get_inject
+                    if gi is not None and not gi.done.is_set():
+                        now2 = time.time()
+                        if not gi.sent or now2 - gi.last_tx > 0.4:   # initial send / retransmit
+                            self._sock.sendto(
+                                build_ioctl_data(self._R, self._seq, self._relseq,
+                                                 self._frmno, gi.io_type, gi.payload),
+                                self._cam)
+                            self._seq += 1                           # every (re)tx burns one pkt seq
+                            if not gi.sent:                          # the request reliable-seq/FrmNo once
+                                self._relseq += 1
+                                self._frmno += 1
+                                gi.sent = True
+                            gi.last_tx = now2
+                except OSError:
+                    self._stat_tx_err += 1
                 if not r:
                     continue
                 # Drain every datagram queued this wake-up so the kernel RX buffer never
@@ -3954,6 +3974,11 @@ class TUTKDirectSession:
                                 seal_one(m, msgs.pop(m), hi - m)
                                 done_upto = max(done_upto, m)
                                 kf_idxs.discard(m)
+        except BaseException as _e:
+            # An unexpected crash of THIS thread must not look like a normal end of stream: the
+            # consumer would see a dead reader and stop "cleanly" (exit 0). Hand it the error.
+            self._reader_error = _e
+            raise
         finally:
             out_q.put(None)         # signal end-of-stream to the consumer
 
@@ -3994,6 +4019,7 @@ class TUTKDirectSession:
 
         out_q = _queue.Queue(maxsize=600)
         stop_evt = threading.Event()
+        self._reader_error = None
         reader = threading.Thread(target=self._av_reader,
                                   args=(s, out_q, stop_evt), daemon=True)
         # Publish to self so disconnect() can stop the reader before closing the
@@ -4015,6 +4041,9 @@ class TUTKDirectSession:
                     item = out_q.get(timeout=0.2)
                 except _queue.Empty:
                     if not reader.is_alive():
+                        _re = self._reader_error
+                        if _re is not None and not stop_evt.is_set():
+                            raise RuntimeError(f"AV reader thread died: {_re!r}") from _re
                         return
                     if self._stall_s:
                         _rx = self._last_av_rx
@@ -4030,6 +4059,9 @@ class TUTKDirectSession:
                     continue
                 last_item = time.monotonic()
                 if item is None:               # reader ended
+                    _re = self._reader_error
+                    if _re is not None and not stop_evt.is_set():
+                        raise RuntimeError(f"AV reader thread died: {_re!r}") from _re
                     return
                 yield item
                 emitted += 1

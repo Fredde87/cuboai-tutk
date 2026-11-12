@@ -455,6 +455,7 @@ def main() -> None:
     except (ValueError, OSError):
         pass   # not the main thread / unsupported platform — leave the default (best-effort)
 
+    _stream_failed = False
     try:
         if output_format == 'mpegts':
             # MPEG-TS path (Part C): carry per-frame PTS from the camera FRAMEINFO so MSE/HLS play
@@ -473,6 +474,7 @@ def main() -> None:
         pass
     except Exception as e:
         print(f"Stream error: {e}", file=sys.stderr)
+        _stream_failed = True                 # a failed stream must not exit 0 (see below)
     else:
         # The generator ended by itself. With the silence gate that means the camera went quiet
         # for good (R-1): exit NON-ZERO so go2rtc treats the producer as failed and respawns it,
@@ -490,6 +492,10 @@ def main() -> None:
         if _etsf is not None:        # M3: close the gated emit-trace file (was leaked for process life)
             _etsf.close()
         sess.disconnect()
+    if _stream_failed:
+        # "Stream error" used to be followed by a normal return: exit code 0 for a stream that
+        # died (e.g. the reader thread crashing on a network error). Exit non-zero instead.
+        sys.exit(1)
 
 
 if __name__ == '__main__':
