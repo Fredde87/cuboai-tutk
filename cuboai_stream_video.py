@@ -83,6 +83,7 @@ PRODUCTION_ENV = {
     'CUBOAI_CLEAN_GOP':        '1',        # mpegts path: emit only complete AUs, resync at IDR
     'CUBOAI_MUX_AUDIO':        '1',        # mux interleaved AAC into the TS (combined A/V by default)
     'CUBOAI_STALL_S':          '10',       # R-1: end the stream after 10 s of total camera silence
+    'CUBOAI_OUTPUT_STALL_S':   '20',       # backstop: fragments arriving but no AU for 20 s → exit 1
 }
 
 # --raw / --passthrough: the historical byte-for-byte Annex-B passthrough. Forces the OUTPUT

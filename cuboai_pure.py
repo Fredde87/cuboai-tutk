@@ -2201,6 +2201,13 @@ class TUTKDirectSession:
         self._first_au_s = max(self._stall_s, _env_float_pure("CUBOAI_FIRST_AU_S", 20.0))
         self._last_av_rx = None         # time.monotonic() of the last AV fragment (reader stamps it);
                                         # monotonic so an NTP step / VM resume cannot fake a silence
+        # ⚠ REGRESSION SWITCH: =0 restores the permanent freeze after an outage > 256 fragments.
+        self._resync = os.environ.get("CUBOAI_RESYNC", "1") != "0"
+        self._stat_resyncs = 0          # outage resyncs performed by the reader
+        # Backstop for anything that leaves fragments arriving but no access unit coming out (the
+        # silence gate cannot see that): end the stream after this many seconds without an AU once
+        # the stream has produced one. Engine default 0 = OFF; the streamer profile turns it on.
+        self._output_stall_s = max(0.0, _env_float_pure("CUBOAI_OUTPUT_STALL_S", 0.0))
         self._stat_stalls = 0           # generators ended by the silence gate
         # ⚠ BEHAVIOUR SWITCH, default OFF in this release candidate (byte-identical to rc4): parse
         # the 8-byte header extension instead of discarding those fragments. See _strip_av_ext.
@@ -2502,6 +2509,7 @@ class TUTKDirectSession:
     # frames (which carry junk [46:48] values thousands away) while still allowing D to
     # jump over a small burst of genuinely-lost fragments.
     _FRAG_WINDOW = 256
+    _RESYNC_RUN = 24            # consecutive out-of-window frag-seqs that mean "the stream moved on"
     _SACK_MAX_FID = 631         # S82: full-fidelity SACK list cap = native's own loop bound
                                 # (`_sendAVIOFrameACK`@0xe896b stops at frame_len 0x4ff =>
                                 # 50+2*631).  Bounds a pathological OOO gap's frame size.
@@ -2652,6 +2660,21 @@ class TUTKDirectSession:
             hw = self._frag_D
             self._frag_received = {f for f in self._frag_received
                                    if (hw - f) & 0xFFFF <= 1024}
+
+    def _resync_frag_state(self):
+        """Forget the AV fragment window (D/C/edge, received set, hole bookkeeping) so the next
+        fragment re-seeds it — used by the reader's outage resync. Wire effect: our next ACK reports
+        the stream's real position instead of a high-water the camera left behind long ago."""
+        self._frag_D = None
+        self._frag_C = 0xFFFF
+        self._frag_edge = None
+        self._frag_edge_acked = 0xFFFF
+        self._frag_received = set()
+        self._frag_gap_ts = {}
+        self._hole_req_ts = {}
+        self._hole_first_req = {}
+        self._hole_req_count = {}
+        self._holding_kf = False
 
     def _ts_word(self):
         """S82: native's word-swapped 32-bit ACK timestamp value V = now_ms - reference.
@@ -3236,6 +3259,7 @@ class TUTKDirectSession:
             # one field that names a dead-silent session, which every rate/ratio below hides.
             'rx_age_s': (round(time.monotonic() - _lr, 3) if _lr is not None else None),
             'stalls': self._stat_stalls,
+            'resyncs': self._stat_resyncs,
             'ioctl_unanswered_alive': self._stat_ioctl_unanswered_alive,
             'av_ext_frames': self._stat_av_ext,
             'av_ext_parsed': self._av_ext,
@@ -3411,6 +3435,7 @@ class TUTKDirectSession:
         kf_idxs = set()             # KF-grace: msg-indices identified as keyframes (GOP roots)
         last_ack = time.time()
         gmax = None                 # highest accepted global fragment-seq [46:48]
+        oob_prev = -2; oob_run = 0  # outage-resync: last out-of-window frag-seq and its run length
         # ── ACK rate-limiting — match native's ~10 ACKs/s (session-20) ──
         # We pace ACKs to native's cadence instead of the old per-datagram ~113/s: still
         # call _note_cam_data on EVERY datagram (C/D state stays exact), but gate the
@@ -3945,9 +3970,30 @@ class TUTKDirectSession:
                         back = (gmax - frag) & 0xFFFF
                         if fwd <= 256:
                             gmax = frag
+                            oob_run = 0
                         elif back <= 128:
                             pass                       # in-window retransmit fills a gap
                         else:
+                            # OUTAGE RESYNC. A stray frame has an isolated frag-seq; a STREAM THAT
+                            # MOVED ON has consecutive ones. After a network outage longer than the
+                            # window (>256 fragments, ~2.2 s) every later fragment landed here and
+                            # was dropped for good: 0 AUs for the rest of the session, stream open,
+                            # silence gate quiet because fragments still arrive (live 2026-11-12:
+                            # 11.5 min of nothing; = "the session goes silent for good", niruse
+                            # #105). A run of _RESYNC_RUN consecutive frag-seqs AHEAD of the window
+                            # means the camera is simply further on: drop our stale state and let
+                            # the start-of-stream seeding below re-anchor on the next AU start.
+                            if self._resync and fwd < 0x8000:
+                                oob_run = oob_run + 1 if frag == ((oob_prev + 1) & 0xFFFF) else 1
+                                oob_prev = frag
+                                if oob_run >= self._RESYNC_RUN:
+                                    self._stat_resyncs += 1
+                                    print(f"[resync] {oob_run} consecutive fragments {fwd} ahead of the "
+                                          f"window — the stream moved on (outage); re-anchoring",
+                                          file=sys.stderr, flush=True)
+                                    gmax = None; oob_run = 0
+                                    msgs.clear(); kf_idxs.clear()
+                                    self._resync_frag_state()
                             continue                   # out-of-band — drop
                     # Accept only a plausibly-forward message-index (rejects any residual
                     # out-of-band index that would truncate the picture in flight).
@@ -4087,6 +4133,12 @@ class TUTKDirectSession:
                         _re = self._reader_error
                         if _re is not None and not stop_evt.is_set():
                             raise RuntimeError(f"AV reader thread died: {_re!r}") from _re
+                        return
+                    if self._output_stall_s and emitted and time.monotonic() - last_item >= self._output_stall_s:
+                        self._stat_stalls += 1
+                        print(f"[stall] fragments still arriving but no access unit for "
+                              f"{time.monotonic() - last_item:.1f}s (CUBOAI_OUTPUT_STALL_S="
+                              f"{self._output_stall_s:g}) — ending the stream", file=sys.stderr, flush=True)
                         return
                     if self._stall_s:
                         _rx = self._last_av_rx
