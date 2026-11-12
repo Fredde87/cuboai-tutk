@@ -3863,7 +3863,17 @@ class TUTKDirectSession:
                     if len(dec) >= 76 and dec[28] == 0x0C and (dec[29] & 0x08):
                         self._stat_av_ext += 1                 # visible even when not parsed
                         if self._av_ext:
-                            dec = _strip_av_ext(dec)
+                            _n = _strip_av_ext(dec)
+                            if _n is not dec:
+                                # The block IS the camera's periodic 0x0a timing record (ms-clock
+                                # u16, ~resend-timeout u16, u32) riding on a data fragment instead
+                                # of going out as its own 44-byte frame: on real traffic the two
+                                # forms interleave on one ~200 ms cadence (199 standalone + 92
+                                # piggy-backed in 57.4 s). Take the clock from it exactly as from a
+                                # standalone 0x0a, so the 0x0b echo works from the freshest value.
+                                self._cam_clock = struct.unpack_from('<H', dec, 36)[0]
+                                self._cam_clock_ts = time.time()
+                            dec = _n
                     if dec[28] != 0x0C or len(dec) < 68:
                         # S86: capture the camera's ms-clock from cam->host 0x0a [36:38]
                         # so _send_nak can echo it in our 0x0b (THE arming discriminator).
