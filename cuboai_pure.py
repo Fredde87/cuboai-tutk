@@ -2253,6 +2253,10 @@ class TUTKDirectSession:
         # is alive, wait up to this many seconds on the SAME session. 0 = legacy behaviour.
         self._ioctl_alive_wait = max(0.0, _env_float_pure("CUBOAI_IOCTL_ALIVE_WAIT", 8.0))
         self._stat_ioctl_unanswered_alive = 0   # timeouts on a live session (no reconnect done)
+        # Wall-clock cap on ONE ioctl() call across all its attempts and reconnects, so a caller with
+        # its own deadline (e.g. a 20 s poll) keeps room for its other requests. Each attempt's wait
+        # is clipped to what is left; no new attempt starts once it is spent. 0 = no cap.
+        self._ioctl_budget_s = max(0.0, _env_float_pure("CUBOAI_IOCTL_BUDGET_S", 12.0))
         self._stall_s = max(0.0, _env_float_pure("CUBOAI_STALL_S", 0.0))
         # Until THIS read has seen its first AV fragment the allowance is the larger
         # CUBOAI_FIRST_AU_S (default 20 s): video only starts after the deferred 0x0300 (~5 s) and a
@@ -2647,7 +2651,7 @@ class TUTKDirectSession:
         """
         return len(dec) >= 64 and dec[58:64] == b"\x00\x00\x00\x00\x00\x00"
 
-    def _note_cam_data(self, dec):
+    def _note_cam_data(self, dec, rebuilt=False):
         """Record a camera DATA frame and advance the windowed-ACK state.
 
         The camera runs TWO reliable streams, acked by two different fields, so we route
@@ -2701,6 +2705,13 @@ class TUTKDirectSession:
         # first-request->arrival latency into the resend-latency EWMA (no-op when adaptive
         # is off — _hole_first_req stays empty). Before .add so a duplicate resend of an
         # already-received frag can't double-count (the anchor is popped on first arrival).
+        if rebuilt and frag not in self._frag_received:
+            # Rebuilt from parity (see _fec_note), not resent: the hole is filled, so drop its
+            # request bookkeeping — but it is NOT a resend. Request->rebuild time is not a resend
+            # latency (it would pull the grace estimate down) and it is counted in fec_recovered,
+            # not resend_recovered. (Found in review by niruse, 2026-11-13.)
+            self._hole_first_req.pop(frag, None)
+            self._hole_req_ts.pop(frag, None)
         if (self._adaptive_rtt or self._grace_scale) and frag not in self._frag_received:
             self._record_resend_latency(frag)   # FIX#5 also feeds the grace EWMA
         if self._lone_hole and frag not in self._frag_received:
@@ -3193,7 +3204,11 @@ class TUTKDirectSession:
         last_err = None
         _fast = self._ioctl_fast_reconnect
         _cargs = dict(attempts=3, timeout=1.5) if _fast else {}
+        deadline = (time.time() + self._ioctl_budget_s) if self._ioctl_budget_s else None
         for attempt in range(3):
+            if deadline is not None and deadline - time.time() < 0.5:
+                last_err = f"{last_err} (CUBOAI_IOCTL_BUDGET_S={self._ioctl_budget_s:g} spent)"
+                break
             if attempt:
                 self._stat_ioctl_retry += 1
             if self._sock is None or self.session_hdr is None:
@@ -3209,9 +3224,13 @@ class TUTKDirectSession:
                     last_err = "handshake failed (no 0x2041)"
                     time.sleep(0.2)
                     continue
+            timeout, alive_wait = 3.0, self._ioctl_alive_wait
+            if deadline is not None:
+                left = max(0.5, deadline - time.time())
+                timeout, alive_wait = min(timeout, left), min(alive_wait, left)
             try:
-                return self._ioctl_once(type_code, payload, timeout=3.0,
-                                        alive_wait=self._ioctl_alive_wait)
+                return self._ioctl_once(type_code, payload, timeout=timeout,
+                                        alive_wait=alive_wait)
             except TimeoutError as e:
                 self._stat_ioctl_timeout += 1
                 last_err = str(e)
@@ -4050,7 +4069,7 @@ class TUTKDirectSession:
                             self._cam_clock_ts = time.time()
                         maybe_ack()                    # ack ACK/NAK probes (rate-limited)
                         continue
-                    self._note_cam_data(dec)           # advance C/D or data_ack
+                    self._note_cam_data(dec, rebuilt=raw is None)   # advance C/D or data_ack
                     maybe_ack()                        # rate-limited; D/data_ack may have advanced
                     if self._is_io_frame(dec):
                         # Reliable IO/control response (IOCTL retransmit, login/system

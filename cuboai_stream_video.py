@@ -129,6 +129,8 @@ def _clamp_env_knobs():
         ('CUBOAI_VERBOSE_INTERVAL', 0.1, 3600, 5.0, True),
         ('CUBOAI_VERBOSE_CAMERA_STATS_INTERVAL', 1, 86400, None, False),
         ('CUBOAI_LIST_PACE_S', 0, 3600, 0.5, True),   # B-8/R3: also parsed with a bare float()
+        ('CUBOAI_IOCTL_ALIVE_WAIT', 0, 60, 8.0, True),
+        ('CUBOAI_IOCTL_BUDGET_S', 0, 120, 12.0, True),
     ]
     for env, lo, hi, dflt, isf in KNOBS:
         raw = os.environ.get(env)
